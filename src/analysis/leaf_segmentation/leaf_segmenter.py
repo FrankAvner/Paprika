@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 import cv2
@@ -7,12 +8,152 @@ from ultralytics import SAM
 
 
 class LeafSegmenter:
+    """
+    Leaf Segmenter V5
+    ==================
 
-    def __init__(self, model_path=None):
-        self.model_path = Path(model_path) if model_path else None
+    Designed for dense paprika plants containing many overlapping
+    and partially occluded leaves.
+
+    Pipeline:
+
+        1. Full-image SAM automatic segmentation
+        2. Overlapping tile segmentation
+        3. Dense interior-point discovery
+        4. Independent SAM point prompts
+        5. Candidate validation
+        6. Clump detection
+        7. Watershed splitting of dense clumps
+        8. Small-leaf preservation
+        9. Fast bbox pre-filter
+       10. IoU + containment deduplication
+       11. Spatial leaf numbering
+       12. Original-image coordinates
+
+    Public API remains compatible with the existing GUI:
+
+        segmenter = LeafSegmenter(model_path)
+        leaves = segmenter.segment(image_path)
+
+    Every returned leaf contains a full-resolution mask in the
+    ORIGINAL image coordinate system.
+    """
+
+    def __init__(
+        self,
+        model_path=None,
+        tile_size=1024,
+        tile_overlap=0.35,
+
+        # Small leaves must survive.
+        min_area_ratio=0.00002,
+
+        # A complete bush must never become one leaf.
+        max_area_ratio=0.30,
+
+        duplicate_iou=0.82,
+        containment=0.94,
+
+        imgsz=1024,
+
+        # Smaller stride -> more possible leaf seeds.
+        prompt_stride=72,
+        max_prompt_points=220,
+
+        # Clump splitting.
+        split_min_area=700,
+        split_min_seed_distance=24,
+
+        # SAM confidence.
+        sam_conf=0.10,
+    ):
+        self.model_path = (
+            Path(model_path)
+            if model_path
+            else None
+        )
+
         self.model = None
 
+        # ------------------------------------------------------------
+        # Tile configuration
+        # ------------------------------------------------------------
+
+        self.tile_size = int(tile_size)
+        self.tile_overlap = float(tile_overlap)
+
+        # ------------------------------------------------------------
+        # Mask filtering
+        # ------------------------------------------------------------
+
+        self.min_area_ratio = float(
+            min_area_ratio
+        )
+
+        self.max_area_ratio = float(
+            max_area_ratio
+        )
+
+        # ------------------------------------------------------------
+        # Duplicate suppression
+        # ------------------------------------------------------------
+
+        self.duplicate_iou = float(
+            duplicate_iou
+        )
+
+        self.containment = float(
+            containment
+        )
+
+        # ------------------------------------------------------------
+        # SAM
+        # ------------------------------------------------------------
+
+        self.imgsz = int(imgsz)
+        self.sam_conf = float(sam_conf)
+
+        # ------------------------------------------------------------
+        # Prompt discovery
+        # ------------------------------------------------------------
+
+        self.prompt_stride = int(
+            prompt_stride
+        )
+
+        self.max_prompt_points = int(
+            max_prompt_points
+        )
+
+        # ------------------------------------------------------------
+        # Clump splitting
+        # ------------------------------------------------------------
+
+        self.split_min_area = int(
+            split_min_area
+        )
+
+        self.split_min_seed_distance = int(
+            split_min_seed_distance
+        )
+
+        # Protection against a whole bush being returned as one SAM object.
+        self.clump_area_ratio = 0.008
+        self.clump_min_area = max(1200, self.split_min_area)
+
+        # A parent mask is removed only when several independent leaves
+        # explain a substantial part of it.
+        self.parent_coverage_threshold = 0.42
+        self.parent_min_children = 2
+
+        self.diagnostics = {}
+
+    # ================================================================
+    # MODEL
+    # ================================================================
+
     def load_model(self):
+
         if self.model_path is None:
             raise ValueError(
                 "Leaf segmentation model path was not provided."
@@ -25,51 +166,1790 @@ class LeafSegmenter:
             )
 
         print(
-            "[LEAF SEGMENTER] "
+            "[LEAF SEGMENTER V5] "
             f"Loading SAM model: {self.model_path}",
-            flush=True
+            flush=True,
         )
 
-        self.model = SAM(str(self.model_path))
+        self.model = SAM(
+            str(self.model_path)
+        )
 
         print(
-            "[LEAF SEGMENTER] SAM model loaded successfully.",
-            flush=True
+            "[LEAF SEGMENTER V5] "
+            "SAM model loaded successfully.",
+            flush=True,
         )
 
-    def clean_mask(self, mask_binary):
-        kernel = np.ones((3, 3), np.uint8)
-        cleaned = cv2.morphologyEx(
+    # ================================================================
+    # MASK UTILITIES
+    # ================================================================
+
+    @staticmethod
+    def clean_mask(mask_binary):
+
+        mask_binary = (
+            (mask_binary > 0)
+            .astype(np.uint8)
+            * 255
+        )
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        )
+
+        mask_binary = cv2.morphologyEx(
             mask_binary,
             cv2.MORPH_OPEN,
             kernel,
-            iterations=1
+            iterations=1,
         )
-        cleaned = cv2.morphologyEx(
-            cleaned,
+
+        mask_binary = cv2.morphologyEx(
+            mask_binary,
             cv2.MORPH_CLOSE,
             kernel,
-            iterations=1
+            iterations=1,
         )
-        return cleaned
 
-    def mask_iou(self, mask_a, mask_b):
+        return mask_binary
+
+    @staticmethod
+    def bbox_from_mask(mask):
+
+        ys, xs = np.where(
+            mask > 0
+        )
+
+        if len(xs) == 0:
+            return None
+
+        return (
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max()),
+            int(ys.max()),
+        )
+
+    @staticmethod
+    def bbox_iou(
+        bbox_a,
+        bbox_b,
+    ):
+
+        ax1, ay1, ax2, ay2 = bbox_a
+        bx1, by1, bx2, by2 = bbox_b
+
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        if ix2 < ix1 or iy2 < iy1:
+            return 0.0
+
+        intersection = (
+            (ix2 - ix1 + 1)
+            *
+            (iy2 - iy1 + 1)
+        )
+
+        area_a = (
+            (ax2 - ax1 + 1)
+            *
+            (ay2 - ay1 + 1)
+        )
+
+        area_b = (
+            (bx2 - bx1 + 1)
+            *
+            (by2 - by1 + 1)
+        )
+
+        union = (
+            area_a
+            +
+            area_b
+            -
+            intersection
+        )
+
+        if union <= 0:
+            return 0.0
+
+        return float(
+            intersection / union
+        )
+
+    @staticmethod
+    def mask_iou(
+        mask_a,
+        mask_b,
+    ):
+
         a = mask_a > 0
         b = mask_b > 0
 
-        intersection = np.count_nonzero(a & b)
-        union = np.count_nonzero(a | b)
+        intersection = np.count_nonzero(
+            a & b
+        )
+
+        union = np.count_nonzero(
+            a | b
+        )
 
         if union == 0:
             return 0.0
 
-        return intersection / union
+        return float(
+            intersection / union
+        )
 
-    def segment(self, image_path):
+    @staticmethod
+    def mask_containment(
+        mask_small,
+        mask_large,
+    ):
+
+        a = mask_small > 0
+        b = mask_large > 0
+
+        small_area = np.count_nonzero(a)
+
+        if small_area == 0:
+            return 0.0
+
+        intersection = np.count_nonzero(
+            a & b
+        )
+
+        return float(
+            intersection / small_area
+        )
+
+    # ================================================================
+    # TILE GENERATION
+    # ================================================================
+
+    def _tile_positions(
+        self,
+        width,
+        height,
+    ):
+
+        tile_w = min(
+            self.tile_size,
+            width,
+        )
+
+        tile_h = min(
+            self.tile_size,
+            height,
+        )
+
+        step_x = max(
+            1,
+            int(
+                tile_w
+                *
+                (1.0 - self.tile_overlap)
+            ),
+        )
+
+        step_y = max(
+            1,
+            int(
+                tile_h
+                *
+                (1.0 - self.tile_overlap)
+            ),
+        )
+
+        xs = list(
+            range(
+                0,
+                max(
+                    1,
+                    width - tile_w + 1,
+                ),
+                step_x,
+            )
+        )
+
+        ys = list(
+            range(
+                0,
+                max(
+                    1,
+                    height - tile_h + 1,
+                ),
+                step_y,
+            )
+        )
+
+        last_x = max(
+            0,
+            width - tile_w,
+        )
+
+        last_y = max(
+            0,
+            height - tile_h,
+        )
+
+        if not xs or xs[-1] != last_x:
+            xs.append(last_x)
+
+        if not ys or ys[-1] != last_y:
+            ys.append(last_y)
+
+        tiles = []
+
+        for y in ys:
+            for x in xs:
+
+                x2 = min(
+                    width,
+                    x + tile_w,
+                )
+
+                y2 = min(
+                    height,
+                    y + tile_h,
+                )
+
+                tiles.append(
+                    (
+                        x,
+                        y,
+                        x2,
+                        y2,
+                    )
+                )
+
+        return tiles
+
+    # ================================================================
+    # AUTOMATIC SAM
+    # ================================================================
+
+    def _run_sam(
+        self,
+        image,
+    ):
+
+        return self.model.predict(
+            source=image,
+            crop_n_layers=1,
+            points_stride=32,
+            conf=self.sam_conf,
+            verbose=False,
+            imgsz=self.imgsz,
+            retina_masks=True,
+        )
+
+    # ================================================================
+    # EXTRACT AUTOMATIC MASKS
+    # ================================================================
+
+    def _extract_candidates(
+        self,
+        results,
+        full_width,
+        full_height,
+        offset_x=0,
+        offset_y=0,
+        source_pass="full",
+        tile_bbox=None,
+    ):
+
+        candidates = []
+
+        if not results:
+            return candidates
+
+        min_area = max(
+            20,
+            int(
+                full_width
+                *
+                full_height
+                *
+                self.min_area_ratio
+            ),
+        )
+
+        max_area = int(
+            full_width
+            *
+            full_height
+            *
+            self.max_area_ratio
+        )
+
+        for result in results:
+
+            if result.masks is None:
+                continue
+
+            masks = (
+                result.masks.data
+                .cpu()
+                .numpy()
+            )
+
+            if tile_bbox is None:
+
+                target_width = full_width
+                target_height = full_height
+
+            else:
+
+                target_width = (
+                    tile_bbox[2]
+                    -
+                    tile_bbox[0]
+                )
+
+                target_height = (
+                    tile_bbox[3]
+                    -
+                    tile_bbox[1]
+                )
+
+            for source_index, mask in enumerate(
+                masks
+            ):
+
+                mask = cv2.resize(
+                    mask,
+                    (
+                        target_width,
+                        target_height,
+                    ),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+                mask_binary = (
+                    mask > 0.5
+                ).astype(
+                    np.uint8
+                ) * 255
+
+                mask_binary = (
+                    self.clean_mask(
+                        mask_binary
+                    )
+                )
+
+                # ----------------------------------------------------
+                # Convert tile mask to original coordinates.
+                # ----------------------------------------------------
+
+                if (
+                    offset_x != 0
+                    or offset_y != 0
+                ):
+
+                    full_mask = np.zeros(
+                        (
+                            full_height,
+                            full_width,
+                        ),
+                        dtype=np.uint8,
+                    )
+
+                    mh, mw = (
+                        mask_binary.shape
+                    )
+
+                    x2 = min(
+                        full_width,
+                        offset_x + mw,
+                    )
+
+                    y2 = min(
+                        full_height,
+                        offset_y + mh,
+                    )
+
+                    if (
+                        x2 <= offset_x
+                        or y2 <= offset_y
+                    ):
+                        continue
+
+                    full_mask[
+                        offset_y:y2,
+                        offset_x:x2
+                    ] = mask_binary[
+                        :y2 - offset_y,
+                        :x2 - offset_x
+                    ]
+
+                    mask_binary = full_mask
+
+                area = int(
+                    np.count_nonzero(
+                        mask_binary
+                    )
+                )
+
+                if area < min_area:
+                    continue
+
+                if area > max_area:
+                    continue
+
+                bbox = (
+                    self.bbox_from_mask(
+                        mask_binary
+                    )
+                )
+
+                if bbox is None:
+                    continue
+
+                x1, y1, x2, y2 = bbox
+
+                candidates.append(
+                    {
+                        "mask": mask_binary,
+                        "bbox": bbox,
+                        "area": area,
+                        "width": (
+                            x2 - x1 + 1
+                        ),
+                        "height": (
+                            y2 - y1 + 1
+                        ),
+                        "source_index": (
+                            source_index
+                        ),
+                        "source_pass": (
+                            source_pass
+                        ),
+                        "tile_bbox": (
+                            tile_bbox
+                        ),
+                        "prompt_score": 0.0,
+                    }
+                )
+
+        return candidates
+
+    # ================================================================
+    # GREEN / VEGETATION REGION
+    # ================================================================
+
+    @staticmethod
+    def _green_region(
+        image,
+    ):
+
+        hsv = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2HSV,
+        )
+
+        # Intentionally broad.
+        # This is used only for finding seeds,
+        # NOT as the final leaf mask.
+        lower = np.array(
+            [20, 18, 12],
+            dtype=np.uint8,
+        )
+
+        upper = np.array(
+            [105, 255, 255],
+            dtype=np.uint8,
+        )
+
+        green = cv2.inRange(
+            hsv,
+            lower,
+            upper,
+        )
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        )
+
+        green = cv2.morphologyEx(
+            green,
+            cv2.MORPH_OPEN,
+            kernel,
+            iterations=1,
+        )
+
+        return green
+
+    # ================================================================
+    # DENSE INTERIOR POINT DISCOVERY
+    # ================================================================
+
+    def _dense_leaf_points(
+        self,
+        image,
+        existing_mask=None,
+    ):
+        """
+        Find candidate points deep inside vegetation.
+
+        Distance Transform is used to prefer leaf interiors.
+
+        Important:
+        these points are independent prompts.
+        """
+
+        green = self._green_region(
+            image
+        )
+
+        if existing_mask is not None:
+
+            existing_mask = (
+                (existing_mask > 0)
+                .astype(np.uint8)
+                * 255
+            )
+
+            green = cv2.bitwise_and(
+                green,
+                existing_mask,
+            )
+
+        binary = (
+            green > 0
+        ).astype(
+            np.uint8
+        )
+
+        if np.count_nonzero(binary) == 0:
+            return []
+
+        dist = cv2.distanceTransform(
+            binary,
+            cv2.DIST_L2,
+            5,
+        )
+
+        maximum = float(
+            dist.max()
+        )
+
+        if maximum <= 0:
+            return []
+
+        # Lower threshold than V3:
+        # more candidate leaf interiors.
+        peak_threshold = max(
+            3.0,
+            maximum * 0.18,
+        )
+
+        peaks = (
+            dist >= peak_threshold
+        ).astype(
+            np.uint8
+        )
+
+        peaks = cv2.morphologyEx(
+            peaks,
+            cv2.MORPH_OPEN,
+            np.ones(
+                (3, 3),
+                np.uint8,
+            ),
+        )
+
+        count, labels, stats, centroids = (
+            cv2.connectedComponentsWithStats(
+                peaks,
+                connectivity=8,
+            )
+        )
+
+        points = []
+
+        for index in range(
+            1,
+            count,
+        ):
+
+            area = stats[
+                index,
+                cv2.CC_STAT_AREA,
+            ]
+
+            if area < 3:
+                continue
+
+            cx, cy = centroids[index]
+
+            ix = int(round(cx))
+            iy = int(round(cy))
+
+            if not (
+                0 <= ix < dist.shape[1]
+                and
+                0 <= iy < dist.shape[0]
+            ):
+                continue
+
+            strength = float(
+                dist[iy, ix]
+            )
+
+            points.append(
+                {
+                    "x": ix,
+                    "y": iy,
+                    "strength": strength,
+                }
+            )
+
+        points.sort(
+            key=lambda p: p["strength"],
+            reverse=True,
+        )
+
+        # ------------------------------------------------------------
+        # Spatial suppression.
+        #
+        # The old V3 configuration could suppress nearby leaves.
+        # Here the radius is deliberately smaller.
+        # ------------------------------------------------------------
+
+        selected = []
+
+        min_distance = max(
+            12,
+            int(
+                self.prompt_stride
+                * 0.25
+            ),
+        )
+
+        for point in points:
+
+            too_close = False
+
+            for existing in selected:
+
+                dx = (
+                    point["x"]
+                    -
+                    existing["x"]
+                )
+
+                dy = (
+                    point["y"]
+                    -
+                    existing["y"]
+                )
+
+                distance_sq = (
+                    dx * dx
+                    +
+                    dy * dy
+                )
+
+                if (
+                    distance_sq
+                    <
+                    min_distance
+                    *
+                    min_distance
+                ):
+                    too_close = True
+                    break
+
+            if too_close:
+                continue
+
+            selected.append(point)
+
+            if (
+                len(selected)
+                >= self.max_prompt_points
+            ):
+                break
+
+        return selected
+
+    # ================================================================
+    # INDEPENDENT SAM POINT PROMPT
+    # ================================================================
+
+    def _run_single_point_prompt(
+        self,
+        image,
+        point,
+        source_pass="prompt",
+        tile_bbox=None,
+    ):
+        """
+        Run ONE independent foreground prompt.
+
+        We deliberately do NOT send all points at once.
+
+        A multi-point SAM prompt can represent one object.
+        For leaf counting we need independent objects.
+        """
+
+        height, width = (
+            image.shape[:2]
+        )
+
+        x = float(point["x"])
+        y = float(point["y"])
+
+        try:
+
+            results = self.model.predict(
+                source=image,
+
+                # IMPORTANT:
+                # one point = one independent prompt
+                points=[
+                    x,
+                    y,
+                ],
+
+                labels=[
+                    1,
+                ],
+
+                verbose=False,
+                imgsz=self.imgsz,
+                retina_masks=True,
+            )
+
+        except Exception as exc:
+
+            print(
+                "[LEAF SEGMENTER V5] "
+                f"Point prompt failed "
+                f"({int(x)},{int(y)}): "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+            return []
+
+        if not results:
+            return []
+
+        candidates = []
+
+        for result in results:
+
+            if result.masks is None:
+                continue
+
+            masks = (
+                result.masks.data
+                .cpu()
+                .numpy()
+            )
+
+            scores = None
+
+            if (
+                hasattr(result, "boxes")
+                and result.boxes is not None
+                and hasattr(result.boxes, "conf")
+            ):
+                try:
+                    scores = (
+                        result.boxes.conf
+                        .cpu()
+                        .numpy()
+                    )
+                except Exception:
+                    scores = None
+
+            for mask_index, mask in enumerate(
+                masks
+            ):
+
+                mask = cv2.resize(
+                    mask,
+                    (
+                        width,
+                        height,
+                    ),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+                mask_binary = (
+                    mask > 0.5
+                ).astype(
+                    np.uint8
+                ) * 255
+
+                mask_binary = (
+                    self.clean_mask(
+                        mask_binary
+                    )
+                )
+
+                if mask_binary[
+                    int(round(y)),
+                    int(round(x))
+                ] == 0:
+                    continue
+
+                area = int(
+                    np.count_nonzero(
+                        mask_binary
+                    )
+                )
+
+                min_area = max(
+                    20,
+                    int(
+                        width
+                        *
+                        height
+                        *
+                        self.min_area_ratio
+                    ),
+                )
+
+                max_area = int(
+                    width
+                    *
+                    height
+                    *
+                    self.max_area_ratio
+                )
+
+                if area < min_area:
+                    continue
+
+                if area > max_area:
+                    continue
+
+                bbox = (
+                    self.bbox_from_mask(
+                        mask_binary
+                    )
+                )
+
+                if bbox is None:
+                    continue
+
+                score = 0.0
+
+                if (
+                    scores is not None
+                    and
+                    mask_index < len(scores)
+                ):
+                    score = float(
+                        scores[mask_index]
+                    )
+
+                candidates.append(
+                    {
+                        "mask": mask_binary,
+                        "bbox": bbox,
+                        "area": area,
+                        "width": (
+                            bbox[2]
+                            -
+                            bbox[0]
+                            +
+                            1
+                        ),
+                        "height": (
+                            bbox[3]
+                            -
+                            bbox[1]
+                            +
+                            1
+                        ),
+                        "source_index": (
+                            mask_index
+                        ),
+                        "source_pass": (
+                            source_pass
+                        ),
+                        "tile_bbox": (
+                            tile_bbox
+                        ),
+                        "prompt_score": score,
+                        "_prompt_x": int(
+                            round(x)
+                        ),
+                        "_prompt_y": int(
+                            round(y)
+                        ),
+                    }
+                )
+
+        # Best mask first.
+        candidates.sort(
+            key=lambda c: (
+                c["prompt_score"],
+                -c["area"],
+            ),
+            reverse=True,
+        )
+
+        return candidates
+
+    # ================================================================
+    # POINT PROMPTS
+    # ================================================================
+
+    def _run_point_prompts(
+        self,
+        image,
+        points,
+        source_pass="prompt",
+        tile_bbox=None,
+    ):
+        """
+        Run every point independently.
+
+        This is intentionally slower than a multi-point call,
+        but it is much safer for leaf counting.
+        """
+
+        candidates = []
+
+        for point_number, point in enumerate(
+            points,
+            start=1,
+        ):
+
+            if point_number % 10 == 0:
+                print(
+                    "[LEAF SEGMENTER V5] "
+                    f"Prompt {point_number}/"
+                    f"{len(points)}",
+                    flush=True,
+                )
+
+            point_candidates = (
+                self._run_single_point_prompt(
+                    image,
+                    point,
+                    source_pass=source_pass,
+                    tile_bbox=tile_bbox,
+                )
+            )
+
+            if not point_candidates:
+                continue
+
+            # For a leaf count we keep the best response for the prompt.
+            best = point_candidates[0]
+
+            candidates.append(
+                best
+            )
+
+        return candidates
+
+    # ================================================================
+    # SUSPICIOUS CLUMP
+    # ================================================================
+
+    def _is_suspicious_clump(
+        self,
+        candidate,
+        image_width,
+        image_height,
+    ):
+
+        image_area = (
+            image_width
+            *
+            image_height
+        )
+
+        area_ratio = (
+            candidate["area"]
+            /
+            float(image_area)
+        )
+
+        width = candidate["width"]
+        height = candidate["height"]
+
+        aspect = (
+            max(width, height)
+            /
+            max(
+                1,
+                min(width, height),
+            )
+        )
+
+        # Large mask.
+        if area_ratio > 0.020:
+            return True
+
+        # Extremely elongated.
+        if aspect > 4.5:
+            return True
+
+        # Large horizontal clump.
+        if (
+            width > image_width * 0.35
+            and
+            height > image_height * 0.18
+        ):
+            return True
+
+        # Large vertical clump.
+        if (
+            height > image_height * 0.35
+            and
+            width > image_width * 0.18
+        ):
+            return True
+
+        return False
+
+    # ================================================================
+    # CLUMP POINTS
+    # ================================================================
+
+    def _clump_points(
+        self,
+        candidate,
+        image,
+    ):
+
+        x1, y1, x2, y2 = (
+            candidate["bbox"]
+        )
+
+        padding = 5
+
+        rx1 = max(
+            0,
+            x1 - padding,
+        )
+
+        ry1 = max(
+            0,
+            y1 - padding,
+        )
+
+        rx2 = min(
+            image.shape[1],
+            x2 + padding + 1,
+        )
+
+        ry2 = min(
+            image.shape[0],
+            y2 + padding + 1,
+        )
+
+        region = image[
+            ry1:ry2,
+            rx1:rx2,
+        ]
+
+        local_mask = candidate[
+            "mask"
+        ][
+            ry1:ry2,
+            rx1:rx2
+        ]
+
+        local_points = (
+            self._dense_leaf_points(
+                region,
+                local_mask,
+            )
+        )
+
+        points = []
+
+        for point in local_points:
+
+            points.append(
+                {
+                    "x": (
+                        point["x"]
+                        +
+                        rx1
+                    ),
+                    "y": (
+                        point["y"]
+                        +
+                        ry1
+                    ),
+                    "strength": (
+                        point["strength"]
+                    ),
+                }
+            )
+
+        return points
+
+    # ================================================================
+    # WATERSHED SPLITTING
+    # ================================================================
+
+    def _watershed_split(
+        self,
+        mask,
+        seed_points,
+    ):
+        """
+        Split one large connected mask into several regions.
+
+        Used when SAM gives us something like:
+
+            [ 5 overlapping leaves ]
+
+        instead of:
+
+            [ leaf 1 ]
+            [ leaf 2 ]
+            [ leaf 3 ]
+            [ leaf 4 ]
+            [ leaf 5 ]
+        """
+
+        if len(seed_points) < 2:
+            return [mask]
+
+        area = int(
+            np.count_nonzero(
+                mask > 0
+            )
+        )
+
+        if area < self.split_min_area:
+            return [mask]
+
+        bbox = (
+            self.bbox_from_mask(
+                mask
+            )
+        )
+
+        if bbox is None:
+            return [mask]
+
+        x1, y1, x2, y2 = bbox
+
+        local_mask = mask[
+            y1:y2 + 1,
+            x1:x2 + 1
+        ]
+
+        local_h, local_w = (
+            local_mask.shape
+        )
+
+        markers = np.zeros(
+            (
+                local_h,
+                local_w,
+            ),
+            dtype=np.int32,
+        )
+
+        marker_id = 1
+        used = []
+
+        for point in seed_points:
+
+            px = (
+                int(point["x"])
+                -
+                x1
+            )
+
+            py = (
+                int(point["y"])
+                -
+                y1
+            )
+
+            if not (
+                0 <= px < local_w
+                and
+                0 <= py < local_h
+            ):
+                continue
+
+            if local_mask[
+                py,
+                px
+            ] == 0:
+                continue
+
+            # Prevent two markers at almost identical locations.
+            too_close = False
+
+            for ux, uy in used:
+
+                dx = px - ux
+                dy = py - uy
+
+                if (
+                    dx * dx
+                    +
+                    dy * dy
+                    <
+                    self.split_min_seed_distance
+                    *
+                    self.split_min_seed_distance
+                ):
+                    too_close = True
+                    break
+
+            if too_close:
+                continue
+
+            radius = max(
+                2,
+                min(
+                    6,
+                    int(
+                        point["strength"]
+                        * 0.18
+                    ),
+                ),
+            )
+
+            cv2.circle(
+                markers,
+                (
+                    px,
+                    py,
+                ),
+                radius,
+                marker_id,
+                -1,
+            )
+
+            used.append(
+                (
+                    px,
+                    py,
+                )
+            )
+
+            marker_id += 1
+
+        if marker_id <= 2:
+            return [mask]
+
+        # ------------------------------------------------------------
+        # Distance transform.
+        # ------------------------------------------------------------
+
+        dist = cv2.distanceTransform(
+            (
+                local_mask > 0
+            ).astype(
+                np.uint8
+            ),
+            cv2.DIST_L2,
+            5,
+        )
+
+        if dist.max() <= 0:
+            return [mask]
+
+        normalized = cv2.normalize(
+            dist,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX,
+        ).astype(
+            np.uint8
+        )
+
+        # Make strong leaf interiors into watershed basins.
+        watershed_gray = 255 - normalized
+
+        pseudo = cv2.merge(
+            [
+                watershed_gray,
+                watershed_gray,
+                watershed_gray,
+            ]
+        )
+
+        # ------------------------------------------------------------
+        # Watershed.
+        # ------------------------------------------------------------
+
+        cv2.watershed(
+            pseudo,
+            markers,
+        )
+
+        pieces = []
+
+        for label in range(
+            1,
+            marker_id,
+        ):
+
+            piece_local = np.zeros(
+                (
+                    local_h,
+                    local_w,
+                ),
+                dtype=np.uint8,
+            )
+
+            piece_local[
+                markers == label
+            ] = 255
+
+            piece_area = int(
+                np.count_nonzero(
+                    piece_local
+                )
+            )
+
+            # Tiny watershed fragments are discarded.
+            if (
+                piece_area
+                <
+                max(
+                    80,
+                    int(
+                        self.split_min_area
+                        * 0.20
+                    ),
+                )
+            ):
+                continue
+
+            piece = np.zeros_like(
+                mask,
+                dtype=np.uint8,
+            )
+
+            piece[
+                y1:y2 + 1,
+                x1:x2 + 1
+            ] = piece_local
+
+            pieces.append(
+                piece
+            )
+
+        # If splitting failed, preserve the original candidate.
+        if len(pieces) < 2:
+            return [mask]
+
+        return pieces
+
+    # ================================================================
+    # LEAF VALIDATION
+    # ================================================================
+
+    def _is_reasonable_leaf(
+        self,
+        mask,
+        image_shape,
+        prompt_point=None,
+    ):
+
+        height, width = (
+            image_shape[:2]
+        )
+
+        area = int(
+            np.count_nonzero(
+                mask > 0
+            )
+        )
+
+        image_area = (
+            width
+            *
+            height
+        )
+
+        min_area = max(
+            80,
+            int(
+                image_area
+                *
+                self.min_area_ratio
+            ),
+        )
+
+        max_area = int(
+            image_area
+            *
+            self.max_area_ratio
+        )
+
+        if area < min_area:
+            return False
+
+        if area > max_area:
+            return False
+
+        bbox = (
+            self.bbox_from_mask(
+                mask
+            )
+        )
+
+        if bbox is None:
+            return False
+
+        x1, y1, x2, y2 = bbox
+
+        bw = (
+            x2
+            -
+            x1
+            +
+            1
+        )
+
+        bh = (
+            y2
+            -
+            y1
+            +
+            1
+        )
+
+        if bw < 8 or bh < 8:
+            return False
+
+        aspect = (
+            max(bw, bh)
+            /
+            max(
+                1,
+                min(bw, bh),
+            )
+        )
+
+        # Very thin shapes are generally stems/noise.
+        if aspect > 8.0:
+            return False
+
+        if prompt_point is not None:
+
+            px = int(
+                prompt_point["x"]
+            )
+
+            py = int(
+                prompt_point["y"]
+            )
+
+            if (
+                0 <= px < width
+                and
+                0 <= py < height
+            ):
+
+                if mask[
+                    py,
+                    px
+                ] == 0:
+                    return False
+
+        return True
+
+    # ================================================================
+    # DEDUPLICATION
+    # ================================================================
+
+    def _deduplicate(
+        self,
+        candidates,
+    ):
+        """
+        Remove duplicate detections.
+
+        IMPORTANT:
+        A small leaf inside a large coarse SAM mask is NOT automatically
+        considered a duplicate.
+        """
+
+        priority = {
+            "prompt_clump": 5,
+            "prompt": 4,
+            "watershed": 4,
+            "prompt_split": 4,
+            "tile": 2,
+            "full": 1,
+        }
+
+        candidates = sorted(
+            candidates,
+            key=lambda item: (
+                priority.get(
+                    item.get(
+                        "source_pass",
+                        "full",
+                    ),
+                    0,
+                ),
+                item.get(
+                    "prompt_score",
+                    0.0,
+                ),
+                item["area"],
+            ),
+            reverse=True,
+        )
+
+        accepted = []
+
+        for candidate in candidates:
+
+            duplicate = False
+
+            for existing in accepted:
+
+                # ----------------------------------------------------
+                # Fast bbox rejection.
+                # ----------------------------------------------------
+
+                bbox_overlap = (
+                    self.bbox_iou(
+                        candidate["bbox"],
+                        existing["bbox"],
+                    )
+                )
+
+                if bbox_overlap <= 0:
+                    continue
+
+                # ----------------------------------------------------
+                # Mask IoU.
+                # ----------------------------------------------------
+
+                iou = self.mask_iou(
+                    candidate["mask"],
+                    existing["mask"],
+                )
+
+                if (
+                    iou
+                    >=
+                    self.duplicate_iou
+                ):
+                    duplicate = True
+                    break
+
+                # ----------------------------------------------------
+                # Containment.
+                #
+                # Only compare containment if the areas are similar.
+                # This prevents a real small leaf from disappearing
+                # because it happens to be inside a large SAM mask.
+                # ----------------------------------------------------
+
+                area_small = min(
+                    candidate["area"],
+                    existing["area"],
+                )
+
+                area_large = max(
+                    candidate["area"],
+                    existing["area"],
+                )
+
+                area_ratio = (
+                    area_small
+                    /
+                    float(
+                        max(
+                            1,
+                            area_large,
+                        )
+                    )
+                )
+
+                if area_ratio >= 0.80:
+
+                    containment_a = (
+                        self.mask_containment(
+                            candidate["mask"],
+                            existing["mask"],
+                        )
+                    )
+
+                    containment_b = (
+                        self.mask_containment(
+                            existing["mask"],
+                            candidate["mask"],
+                        )
+                    )
+
+                    if (
+                        containment_a
+                        >=
+                        self.containment
+                        or
+                        containment_b
+                        >=
+                        self.containment
+                    ):
+                        duplicate = True
+                        break
+
+            if not duplicate:
+                accepted.append(
+                    candidate
+                )
+
+        return accepted
+
+    # ================================================================
+    # BUILD FINAL LEAF OBJECTS
+    # ================================================================
+
+    def _build_leaves(
+        self,
+        candidates,
+    ):
+
+        candidates.sort(
+            key=lambda item: (
+                item["bbox"][1],
+                item["bbox"][0],
+            )
+        )
+
+        leaves = []
+
+        for leaf_number, candidate in enumerate(
+            candidates,
+            start=1,
+        ):
+
+            mask = candidate[
+                "mask"
+            ]
+
+            ys, xs = np.where(
+                mask > 0
+            )
+
+            if len(xs) == 0:
+                continue
+
+            x1, y1, x2, y2 = (
+                candidate["bbox"]
+            )
+
+            leaves.append(
+                {
+                    "id": leaf_number,
+
+                    "source_index": (
+                        candidate[
+                            "source_index"
+                        ]
+                        + 1
+                    ),
+
+                    # Full-resolution original-image mask.
+                    "mask": mask,
+
+                    # Original-image coordinates.
+                    "bbox": (
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                    ),
+
+                    "area": int(
+                        candidate["area"]
+                    ),
+
+                    "width": (
+                        x2
+                        -
+                        x1
+                        +
+                        1
+                    ),
+
+                    "height": (
+                        y2
+                        -
+                        y1
+                        +
+                        1
+                    ),
+
+                    "center_x": float(
+                        xs.mean()
+                    ),
+
+                    "center_y": float(
+                        ys.mean()
+                    ),
+
+                    "source_pass": (
+                        candidate[
+                            "source_pass"
+                        ]
+                    ),
+
+                    "tile_bbox": (
+                        candidate.get(
+                            "tile_bbox"
+                        )
+                    ),
+
+                    "prompt_score": float(
+                        candidate.get(
+                            "prompt_score",
+                            0.0,
+                        )
+                    ),
+                }
+            )
+
+        # Renumber after invalid candidates were removed.
+        for leaf_number, leaf in enumerate(
+            leaves,
+            start=1,
+        ):
+            leaf["id"] = leaf_number
+
+        return leaves
+
+    # ================================================================
+    # MAIN SEGMENTATION
+    # ================================================================
+
+    def segment(
+        self,
+        image_path,
+    ):
+
         if self.model is None:
             self.load_model()
 
-        image_path = Path(image_path)
+        image_path = Path(
+            image_path
+        )
 
         if not image_path.exists():
             raise FileNotFoundError(
@@ -78,12 +1958,25 @@ class LeafSegmenter:
             )
 
         print(
-            "[LEAF SEGMENTER] "
-            f"Starting segmentation: {image_path}",
-            flush=True
+            "\n"
+            + "=" * 72,
+            flush=True,
         )
 
-        image = cv2.imread(str(image_path))
+        print(
+            "[LEAF SEGMENTER V5] START",
+            flush=True,
+        )
+
+        print(
+            f"[LEAF SEGMENTER V5] "
+            f"Image: {image_path}",
+            flush=True,
+        )
+
+        image = cv2.imread(
+            str(image_path)
+        )
 
         if image is None:
             raise ValueError(
@@ -91,212 +1984,579 @@ class LeafSegmenter:
                 f"{image_path}"
             )
 
-        height, width = image.shape[:2]
-
-        print(
-            "[LEAF SEGMENTER] "
-            f"Input size: {width} x {height}",
-            flush=True
+        height, width = (
+            image.shape[:2]
         )
 
         print(
-            "[LEAF SEGMENTER] Running SAM 2 inference...",
-            flush=True
+            "[LEAF SEGMENTER V5] "
+            f"Image size: "
+            f"{width} x {height}",
+            flush=True,
         )
 
-        results = self.model(
-            str(image_path),
-            verbose=False
-        )
+        self.diagnostics = {
+            "full_candidates": 0,
+            "tile_candidates": 0,
+            "prompt_points": 0,
+            "prompt_candidates": 0,
+            "clump_candidates": 0,
+            "watershed_pieces": 0,
+            "final_leaves": 0,
+        }
+
+        all_candidates = []
+
+        # ============================================================
+        # PASS 1 — FULL IMAGE
+        # ============================================================
 
         print(
-            "[LEAF SEGMENTER] SAM 2 inference completed.",
-            flush=True
+            "\n[LEAF SEGMENTER V5] "
+            "PASS 1: FULL IMAGE",
+            flush=True,
         )
 
-        if not results:
+        try:
+
+            full_results = (
+                self._run_sam(
+                    image
+                )
+            )
+
+            full_candidates = (
+                self._extract_candidates(
+                    full_results,
+                    width,
+                    height,
+                    source_pass="full",
+                    tile_bbox=None,
+                )
+            )
+
+            all_candidates.extend(
+                full_candidates
+            )
+
+            self.diagnostics[
+                "full_candidates"
+            ] = len(
+                full_candidates
+            )
+
             print(
-                "[LEAF SEGMENTER] No results returned.",
-                flush=True
+                "[LEAF SEGMENTER V5] "
+                f"Full candidates: "
+                f"{len(full_candidates)}",
+                flush=True,
             )
-            return []
 
-        result = results[0]
+        except Exception as exc:
 
-        if result.masks is None:
             print(
-                "[LEAF SEGMENTER] No masks found.",
-                flush=True
-            )
-            return []
-
-        masks = result.masks.data.cpu().numpy()
-
-        total_masks = len(masks)
-
-        print(
-            "[LEAF SEGMENTER] "
-            f"Raw masks detected: {total_masks}",
-            flush=True
-        )
-
-        min_area = max(
-            20,
-            int(width * height * 0.001)
-        )
-
-        max_area = int(width * height * 0.95)
-
-        print(
-            "[LEAF SEGMENTER] "
-            f"Minimum mask area: {min_area}",
-            flush=True
-        )
-
-        print(
-            "[LEAF SEGMENTER] "
-            f"Maximum mask area: {max_area}",
-            flush=True
-        )
-
-        candidates = []
-
-        for index, mask in enumerate(masks):
-            mask = cv2.resize(
-                mask,
-                (width, height),
-                interpolation=cv2.INTER_NEAREST
+                "[LEAF SEGMENTER V5] "
+                f"Full pass failed: {exc}",
+                flush=True,
             )
 
-            mask_binary = (
-                mask > 0.5
-            ).astype(np.uint8) * 255
+        # ============================================================
+        # PASS 2 — OVERLAPPING TILES
+        # ============================================================
 
-            mask_binary = self.clean_mask(mask_binary)
-
-            area = int(np.count_nonzero(mask_binary))
-
-            if area < min_area:
-                print(
-                    "[LEAF SEGMENTER] "
-                    f"Mask {index + 1}/{total_masks} rejected: "
-                    f"area {area} < {min_area}",
-                    flush=True
-                )
-                continue
-
-            if area > max_area:
-                print(
-                    "[LEAF SEGMENTER] "
-                    f"Mask {index + 1}/{total_masks} rejected: "
-                    f"area {area} > {max_area}",
-                    flush=True
-                )
-                continue
-
-            ys, xs = np.where(mask_binary > 0)
-
-            if len(xs) == 0:
-                print(
-                    "[LEAF SEGMENTER] "
-                    f"Mask {index + 1}/{total_masks} rejected: empty",
-                    flush=True
-                )
-                continue
-
-            x1 = int(xs.min())
-            y1 = int(ys.min())
-            x2 = int(xs.max())
-            y2 = int(ys.max())
-
-            candidates.append({
-                "source_index": index,
-                "mask": mask_binary,
-                "bbox": (x1, y1, x2, y2),
-                "area": area,
-                "width": x2 - x1 + 1,
-                "height": y2 - y1 + 1,
-            })
-
-        candidates.sort(
-            key=lambda item: item["area"],
-            reverse=True
+        tiles = self._tile_positions(
+            width,
+            height,
         )
 
-        filtered = []
-        duplicate_iou = 0.85
+        print(
+            "\n[LEAF SEGMENTER V5] "
+            f"PASS 2: {len(tiles)} TILES",
+            flush=True,
+        )
 
-        for candidate in candidates:
-            duplicate = False
+        for tile_number, (
+            x1,
+            y1,
+            x2,
+            y2,
+        ) in enumerate(
+            tiles,
+            start=1,
+        ):
 
-            for accepted in filtered:
-                iou = self.mask_iou(
-                    candidate["mask"],
-                    accepted["mask"]
-                )
+            print(
+                "[LEAF SEGMENTER V5] "
+                f"Tile {tile_number}/"
+                f"{len(tiles)} "
+                f"({x1},{y1})-({x2},{y2})",
+                flush=True,
+            )
 
-                if iou >= duplicate_iou:
-                    duplicate = True
-                    print(
-                        "[LEAF SEGMENTER] "
-                        f"Mask source {candidate['source_index'] + 1} "
-                        f"rejected: duplicate IoU={iou:.3f}",
-                        flush=True
+            tile = image[
+                y1:y2,
+                x1:x2,
+            ]
+
+            try:
+
+                results = (
+                    self._run_sam(
+                        tile
                     )
-                    break
+                )
 
-            if not duplicate:
-                filtered.append(candidate)
+                tile_candidates = (
+                    self._extract_candidates(
+                        results,
+                        width,
+                        height,
+                        offset_x=x1,
+                        offset_y=y1,
+                        source_pass="tile",
+                        tile_bbox=(
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                        ),
+                    )
+                )
 
-        leaves = []
+                all_candidates.extend(
+                    tile_candidates
+                )
 
-        for leaf_number, candidate in enumerate(filtered, start=1):
-            x1, y1, x2, y2 = candidate["bbox"]
+                self.diagnostics[
+                    "tile_candidates"
+                ] += len(
+                    tile_candidates
+                )
 
-            leaf = {
-                "id": leaf_number,
-                "source_index": candidate["source_index"] + 1,
-                "mask": candidate["mask"],
-                "bbox": candidate["bbox"],
-                "area": candidate["area"],
-                "width": candidate["width"],
-                "height": candidate["height"],
-                "center_x": (x1 + x2) / 2.0,
-                "center_y": (y1 + y2) / 2.0,
-            }
+                print(
+                    "[LEAF SEGMENTER V5] "
+                    f"Tile candidates: "
+                    f"{len(tile_candidates)}",
+                    flush=True,
+                )
 
-            leaves.append(leaf)
+            except Exception as exc:
+
+                print(
+                    "[LEAF SEGMENTER V5] "
+                    f"Tile failed: {exc}",
+                    flush=True,
+                )
+
+        # ============================================================
+        # PASS 3 — DENSE POINT RECOVERY
+        # ============================================================
+
+        print(
+            "\n[LEAF SEGMENTER V5] "
+            "PASS 3: DENSE POINT RECOVERY",
+            flush=True,
+        )
+
+        for tile_number, (
+            x1,
+            y1,
+            x2,
+            y2,
+        ) in enumerate(
+            tiles,
+            start=1,
+        ):
+
+            tile = image[
+                y1:y2,
+                x1:x2,
+            ]
+
+            points = (
+                self._dense_leaf_points(
+                    tile
+                )
+            )
+
+            if not points:
+                continue
+
+            self.diagnostics[
+                "prompt_points"
+            ] += len(points)
 
             print(
-                "[LEAF SEGMENTER] "
-                f"Leaf {leaf_number}: "
-                f"area={leaf['area']} "
-                f"bbox=({x1},{y1},{x2},{y2}) "
-                f"size={leaf['width']}x{leaf['height']}",
-                flush=True
+                "[LEAF SEGMENTER V5] "
+                f"Tile {tile_number}: "
+                f"{len(points)} "
+                f"interior points",
+                flush=True,
+            )
+
+            try:
+
+                prompt_candidates = (
+                    self._run_point_prompts(
+                        tile,
+                        points,
+                        source_pass="prompt",
+                        tile_bbox=(
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                        ),
+                    )
+                )
+
+                self.diagnostics[
+                    "prompt_candidates"
+                ] += len(
+                    prompt_candidates
+                )
+
+                # Convert local tile masks to
+                # original-image coordinates.
+                for candidate in (
+                    prompt_candidates
+                ):
+
+                    local_mask = candidate[
+                        "mask"
+                    ]
+
+                    full_mask = np.zeros(
+                        (
+                            height,
+                            width,
+                        ),
+                        dtype=np.uint8,
+                    )
+
+                    mh, mw = (
+                        local_mask.shape
+                    )
+
+                    full_mask[
+                        y1:y1 + mh,
+                        x1:x1 + mw
+                    ] = local_mask
+
+                    candidate[
+                        "mask"
+                    ] = full_mask
+
+                    bbox = (
+                        self.bbox_from_mask(
+                            full_mask
+                        )
+                    )
+
+                    if bbox is None:
+                        continue
+
+                    candidate[
+                        "bbox"
+                    ] = bbox
+
+                    candidate[
+                        "area"
+                    ] = int(
+                        np.count_nonzero(
+                            full_mask
+                        )
+                    )
+
+                    candidate[
+                        "width"
+                    ] = (
+                        bbox[2]
+                        -
+                        bbox[0]
+                        +
+                        1
+                    )
+
+                    candidate[
+                        "height"
+                    ] = (
+                        bbox[3]
+                        -
+                        bbox[1]
+                        +
+                        1
+                    )
+
+                    all_candidates.append(
+                        candidate
+                    )
+
+            except Exception as exc:
+
+                print(
+                    "[LEAF SEGMENTER V5] "
+                    f"Prompt recovery failed: "
+                    f"{exc}",
+                    flush=True,
+                )
+
+        # ============================================================
+        # PASS 4 — CLUMP DETECTION + INDIVIDUAL LEAF SPLITTING
+        # ============================================================
+
+        print(
+            "\n[LEAF SEGMENTER V5] "
+            "PASS 4: CLUMP SPLITTING",
+            flush=True,
+        )
+
+        prefiltered = self._deduplicate(
+            all_candidates
+        )
+
+        print(
+            "[LEAF SEGMENTER V5] "
+            f"Candidates before clump splitting: "
+            f"{len(prefiltered)}",
+            flush=True,
+        )
+
+        final_candidates = []
+
+        for candidate_number, candidate in enumerate(
+            prefiltered,
+            start=1,
+        ):
+            pieces = self._split_candidate_if_needed(
+                candidate,
+                image,
+            )
+
+            if len(pieces) > 1:
+                print(
+                    "[LEAF SEGMENTER V5] "
+                    f"Candidate {candidate_number} "
+                    f"split into {len(pieces)} leaves",
+                    flush=True,
+                )
+
+            final_candidates.extend(
+                pieces
+            )
+
+        # Remove whole-bush/parent masks when individual children
+        # already explain enough of their area.
+        final_candidates = (
+            self._remove_explained_parent_clumps(
+                final_candidates
+            )
+        )
+
+        # FINAL DEDUP
+        # ============================================================
+
+        print(
+            "\n[LEAF SEGMENTER V5] "
+            "FINAL DEDUPLICATION",
+            flush=True,
+        )
+
+        filtered = self._deduplicate(
+            final_candidates
+        )
+
+        # One more parent-clump cleanup after deduplication.
+        filtered = (
+            self._remove_explained_parent_clumps(
+                filtered
+            )
+        )
+
+        # ============================================================
+        # FINAL LEAVES
+        # ============================================================
+
+        leaves = (
+            self._build_leaves(
+                filtered
+            )
+        )
+
+        self.diagnostics[
+            "final_leaves"
+        ] = len(
+            leaves
+        )
+
+        print(
+            "\n"
+            + "=" * 72,
+            flush=True,
+        )
+
+        print(
+            "[LEAF SEGMENTER V5] "
+            "FINAL RESULT",
+            flush=True,
+        )
+
+        print(
+            "[LEAF SEGMENTER V5] "
+            f"LEAVES DETECTED: "
+            f"{len(leaves)}",
+            flush=True,
+        )
+
+        print(
+            "[LEAF SEGMENTER V5] "
+            "Diagnostics:",
+            flush=True,
+        )
+
+        for key, value in (
+            self.diagnostics.items()
+        ):
+
+            print(
+                f"    {key}: {value}",
+                flush=True,
             )
 
         print(
-            "[LEAF SEGMENTER] "
-            f"Valid masks returned: {len(leaves)}",
-            flush=True
+            "=" * 72,
+            flush=True,
         )
+
+        # ------------------------------------------------------------
+        # Leaf list.
+        # ------------------------------------------------------------
+
+        for leaf in leaves:
+
+            print(
+                "[LEAF SEGMENTER V5] "
+                f"Leaf {leaf['id']:03d} "
+                f"bbox={leaf['bbox']} "
+                f"area={leaf['area']} "
+                f"center=("
+                f"{leaf['center_x']:.1f},"
+                f"{leaf['center_y']:.1f}) "
+                f"source={leaf['source_pass']}",
+                flush=True,
+            )
 
         return leaves
 
 
+# ====================================================================
+# DIRECT TEST
+# ====================================================================
+
 if __name__ == "__main__":
-    image_path = Path(
-        r"C:\paprika\images\leafs.jpg"
+
+    # ---------------------------------------------------------------
+    # First test the image you are currently using.
+    # ---------------------------------------------------------------
+
+    IMAGE_PATH = Path(
+        r"C:\paprika\images\test.jpg"
     )
+
+    MODEL_CANDIDATES = [
+        Path(
+            r"C:\paprika\images\sam2.1_b.pt"
+        ),
+        Path(
+            r"C:\paprika\models\sam2.1_b.pt"
+        ),
+        Path(
+            r"C:\paprika\images\sam2_b.pt"
+        ),
+        Path(
+            r"C:\paprika\models\sam2_b.pt"
+        ),
+    ]
+
+    MODEL_PATH = next(
+        (
+            path
+            for path in MODEL_CANDIDATES
+            if path.exists()
+        ),
+        None,
+    )
+
+    if MODEL_PATH is None:
+
+        raise FileNotFoundError(
+            "Could not find SAM2 model.\n\n"
+            "Checked:\n"
+            +
+            "\n".join(
+                str(path)
+                for path in MODEL_CANDIDATES
+            )
+        )
+
+    if not IMAGE_PATH.exists():
+
+        raise FileNotFoundError(
+            "Test image not found:\n"
+            f"{IMAGE_PATH}"
+        )
+
+    # ---------------------------------------------------------------
+    # V4 configuration
+    # ---------------------------------------------------------------
 
     segmenter = LeafSegmenter(
-        r"C:\paprika\images\sam2.1_b.pt"
+
+        model_path=MODEL_PATH,
+
+        # Dense overlapping tiles.
+        tile_size=1024,
+        tile_overlap=0.35,
+
+        # Preserve small leaves.
+        min_area_ratio=0.00002,
+
+        # Never accept a giant bush as one leaf.
+        max_area_ratio=0.30,
+
+        # Duplicate control.
+        duplicate_iou=0.82,
+        containment=0.94,
+
+        # SAM.
+        imgsz=1024,
+        sam_conf=0.10,
+
+        # More interior seeds.
+        prompt_stride=72,
+        max_prompt_points=220,
+
+        # Clump splitting.
+        split_min_area=700,
+        split_min_seed_distance=24,
     )
 
-    leaves = segmenter.segment(image_path)
+    leaves = segmenter.segment(
+        IMAGE_PATH
+    )
 
     print(
-        f"LEAVES DETECTED: {len(leaves)}",
-        flush=True
+        "\n"
+        + "=" * 72,
+        flush=True,
+    )
+
+    print(
+        f"FINAL LEAF COUNT = {len(leaves)}",
+        flush=True,
+    )
+
+    print(
+        "=" * 72,
+        flush=True,
     )

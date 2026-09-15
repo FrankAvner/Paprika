@@ -46,14 +46,15 @@ if str(UI_DIR) not in sys.path:
     sys.path.insert(0, str(UI_DIR))
 
 
-from leaf_segmentation.leaf_segmenter import LeafSegmenter
+from leaf_segmentation.leaf_segmenter import LeafSegmenter, SegmentationStopped
 from roi_selector import ROISelector
 from database_service import DatabaseService
 
 
-MODEL_PATH = Path(r"C:\paprika\images\sam2.1_b.pt")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = PROJECT_ROOT / "images" / "sam2.1_b.pt"
 
-RESULTS_ROOT = Path(r"C:\paprika\results\segmentation")
+RESULTS_ROOT = PROJECT_ROOT / "results" / "segmentation"
 
 PERFORMANCE_HISTORY_FILE = RESULTS_ROOT / "performance_history.json"
 
@@ -196,6 +197,7 @@ class SegmentationWorker(QObject):
         self.model_path = Path(model_path)
         self.roi_rect = roi_rect
         self.stop_requested = False
+        self.segmenter = None
 
         self.media_id = None
         self.run_id = None
@@ -211,6 +213,8 @@ class SegmentationWorker(QObject):
     def request_stop(self):
         self.stop_requested = True
         self.log("STOP requested by user.")
+        if self.segmenter is not None:
+            self.segmenter.request_stop()
 
     def update_database_status(self, status):
         if self.run_id is None:
@@ -564,11 +568,25 @@ class SegmentationWorker(QObject):
                 "STEP 5/8 - Loading SAM 2 model..."
             )
 
-            segmenter = LeafSegmenter(
-                model_path=str(self.model_path)
+            self.segmenter = LeafSegmenter(
+                model_path=str(self.model_path),
+                tile_size=1024,
+                tile_overlap=0.35,
+                min_area_ratio=0.00002,
+                max_area_ratio=0.30,
+                duplicate_iou=0.82,
+                containment=0.94,
+                imgsz=1024,
+                prompt_stride=72,
+                max_prompt_points=80,
+                split_min_area=700,
+                split_min_seed_distance=24,
+                sam_conf=0.10,
+                max_tiles=16,
+                max_total_prompt_points=240,
             )
 
-            segmenter.load_model()
+            self.segmenter.load_model()
 
             self.progress.emit(25)
 
@@ -586,7 +604,7 @@ class SegmentationWorker(QObject):
             else:
                 segmentation_input_path = roi_path
 
-            leaves = segmenter.segment(
+            leaves = self.segmenter.segment(
                 str(segmentation_input_path)
             )
 
@@ -746,6 +764,12 @@ class SegmentationWorker(QObject):
                     "run_id": self.run_id,
                 }
             )
+
+        except SegmentationStopped:
+            self.busy.emit(False)
+            self.update_database_status("stopped")
+            self.stage.emit("SEGMENTATION STOPPED BY USER")
+            self.cancelled.emit()
 
         except Exception as exc:
             self.busy.emit(False)
