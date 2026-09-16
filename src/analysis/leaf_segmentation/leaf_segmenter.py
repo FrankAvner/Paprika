@@ -1,5 +1,5 @@
-
 from pathlib import Path
+import threading
 
 import cv2
 import numpy as np
@@ -7,16 +7,18 @@ import numpy as np
 from ultralytics import SAM
 
 
+class SegmentationStopped(Exception):
+    """Raised when the user requests a cooperative segmentation stop."""
+
+
 class LeafSegmenter:
     """
-    Leaf Segmenter V5
-    ==================
+    Leaf Segmenter V6
 
     Designed for dense paprika plants containing many overlapping
     and partially occluded leaves.
 
     Pipeline:
-
         1. Full-image SAM automatic segmentation
         2. Overlapping tile segmentation
         3. Dense interior-point discovery
@@ -26,9 +28,9 @@ class LeafSegmenter:
         7. Watershed splitting of dense clumps
         8. Small-leaf preservation
         9. Fast bbox pre-filter
-       10. IoU + containment deduplication
-       11. Spatial leaf numbering
-       12. Original-image coordinates
+        10. IoU + containment deduplication
+        11. Spatial leaf numbering
+        12. Original-image coordinates
 
     Public API remains compatible with the existing GUI:
 
@@ -44,116 +46,82 @@ class LeafSegmenter:
         model_path=None,
         tile_size=1024,
         tile_overlap=0.35,
-
-        # Small leaves must survive.
         min_area_ratio=0.00002,
-
-        # A complete bush must never become one leaf.
         max_area_ratio=0.30,
-
         duplicate_iou=0.82,
         containment=0.94,
-
         imgsz=1024,
-
-        # Smaller stride -> more possible leaf seeds.
         prompt_stride=72,
         max_prompt_points=220,
-
-        # Clump splitting.
         split_min_area=700,
         split_min_seed_distance=24,
-
-        # SAM confidence.
         sam_conf=0.10,
+        max_tiles=16,
+        max_total_prompt_points=240,
     ):
-        self.model_path = (
-            Path(model_path)
-            if model_path
-            else None
-        )
-
+        self.model_path = Path(model_path) if model_path else None
         self.model = None
 
-        # ------------------------------------------------------------
-        # Tile configuration
-        # ------------------------------------------------------------
+        self._stop_event = threading.Event()
 
         self.tile_size = int(tile_size)
         self.tile_overlap = float(tile_overlap)
+        self.max_tiles = int(max_tiles)
+        self.max_total_prompt_points = int(max_total_prompt_points)
 
-        # ------------------------------------------------------------
-        # Mask filtering
-        # ------------------------------------------------------------
+        self.last_tile_generation = {
+            "generated": 0,
+            "selected": 0,
+            "skipped": 0,
+        }
 
-        self.min_area_ratio = float(
-            min_area_ratio
-        )
+        self.min_area_ratio = float(min_area_ratio)
+        self.max_area_ratio = float(max_area_ratio)
 
-        self.max_area_ratio = float(
-            max_area_ratio
-        )
-
-        # ------------------------------------------------------------
-        # Duplicate suppression
-        # ------------------------------------------------------------
-
-        self.duplicate_iou = float(
-            duplicate_iou
-        )
-
-        self.containment = float(
-            containment
-        )
-
-        # ------------------------------------------------------------
-        # SAM
-        # ------------------------------------------------------------
+        self.duplicate_iou = float(duplicate_iou)
+        self.containment = float(containment)
 
         self.imgsz = int(imgsz)
         self.sam_conf = float(sam_conf)
 
-        # ------------------------------------------------------------
-        # Prompt discovery
-        # ------------------------------------------------------------
+        self.prompt_stride = int(prompt_stride)
+        self.max_prompt_points = int(max_prompt_points)
 
-        self.prompt_stride = int(
-            prompt_stride
-        )
+        self.split_min_area = int(split_min_area)
+        self.split_min_seed_distance = int(split_min_seed_distance)
 
-        self.max_prompt_points = int(
-            max_prompt_points
-        )
-
-        # ------------------------------------------------------------
-        # Clump splitting
-        # ------------------------------------------------------------
-
-        self.split_min_area = int(
-            split_min_area
-        )
-
-        self.split_min_seed_distance = int(
-            split_min_seed_distance
-        )
-
-        # Protection against a whole bush being returned as one SAM object.
         self.clump_area_ratio = 0.008
-        self.clump_min_area = max(1200, self.split_min_area)
+        self.clump_min_area = max(
+            1200,
+            self.split_min_area,
+        )
 
-        # A parent mask is removed only when several independent leaves
-        # explain a substantial part of it.
         self.parent_coverage_threshold = 0.42
         self.parent_min_children = 2
 
         self.diagnostics = {}
 
-    # ================================================================
-    # MODEL
-    # ================================================================
+    def request_stop(self):
+        self._stop_event.set()
+
+        print(
+            "[LEAF SEGMENTER V6] STOP requested.",
+            flush=True,
+        )
+
+    def clear_stop(self):
+        self._stop_event.clear()
+
+    def is_stop_requested(self):
+        return self._stop_event.is_set()
+
+    def _check_stop(self):
+        if self._stop_event.is_set():
+            raise SegmentationStopped(
+                "Segmentation stopped by user."
+            )
 
     def load_model(self):
-
         if self.model_path is None:
             raise ValueError(
                 "Leaf segmentation model path was not provided."
@@ -166,32 +134,23 @@ class LeafSegmenter:
             )
 
         print(
-            "[LEAF SEGMENTER V5] "
+            "[LEAF SEGMENTER V6] "
             f"Loading SAM model: {self.model_path}",
             flush=True,
         )
 
-        self.model = SAM(
-            str(self.model_path)
-        )
+        self.model = SAM(str(self.model_path))
 
         print(
-            "[LEAF SEGMENTER V5] "
+            "[LEAF SEGMENTER V6] "
             "SAM model loaded successfully.",
             flush=True,
         )
 
-    # ================================================================
-    # MASK UTILITIES
-    # ================================================================
-
     @staticmethod
     def clean_mask(mask_binary):
-
         mask_binary = (
-            (mask_binary > 0)
-            .astype(np.uint8)
-            * 255
+            (mask_binary > 0).astype(np.uint8) * 255
         )
 
         kernel = cv2.getStructuringElement(
@@ -217,10 +176,7 @@ class LeafSegmenter:
 
     @staticmethod
     def bbox_from_mask(mask):
-
-        ys, xs = np.where(
-            mask > 0
-        )
+        ys, xs = np.where(mask > 0)
 
         if len(xs) == 0:
             return None
@@ -233,11 +189,7 @@ class LeafSegmenter:
         )
 
     @staticmethod
-    def bbox_iou(
-        bbox_a,
-        bbox_b,
-    ):
-
+    def bbox_iou(bbox_a, bbox_b):
         ax1, ay1, ax2, ay2 = bbox_a
         bx1, by1, bx2, by2 = bbox_b
 
@@ -251,67 +203,41 @@ class LeafSegmenter:
 
         intersection = (
             (ix2 - ix1 + 1)
-            *
-            (iy2 - iy1 + 1)
+            * (iy2 - iy1 + 1)
         )
 
         area_a = (
             (ax2 - ax1 + 1)
-            *
-            (ay2 - ay1 + 1)
+            * (ay2 - ay1 + 1)
         )
 
         area_b = (
             (bx2 - bx1 + 1)
-            *
-            (by2 - by1 + 1)
+            * (by2 - by1 + 1)
         )
 
-        union = (
-            area_a
-            +
-            area_b
-            -
-            intersection
-        )
+        union = area_a + area_b - intersection
 
         if union <= 0:
             return 0.0
 
-        return float(
-            intersection / union
-        )
+        return float(intersection / union)
 
     @staticmethod
-    def mask_iou(
-        mask_a,
-        mask_b,
-    ):
-
+    def mask_iou(mask_a, mask_b):
         a = mask_a > 0
         b = mask_b > 0
 
-        intersection = np.count_nonzero(
-            a & b
-        )
-
-        union = np.count_nonzero(
-            a | b
-        )
+        intersection = np.count_nonzero(a & b)
+        union = np.count_nonzero(a | b)
 
         if union == 0:
             return 0.0
 
-        return float(
-            intersection / union
-        )
+        return float(intersection / union)
 
     @staticmethod
-    def mask_containment(
-        mask_small,
-        mask_large,
-    ):
-
+    def mask_containment(mask_small, mask_large):
         a = mask_small > 0
         b = mask_large > 0
 
@@ -320,59 +246,28 @@ class LeafSegmenter:
         if small_area == 0:
             return 0.0
 
-        intersection = np.count_nonzero(
-            a & b
-        )
+        intersection = np.count_nonzero(a & b)
 
-        return float(
-            intersection / small_area
-        )
+        return float(intersection / small_area)
 
-    # ================================================================
-    # TILE GENERATION
-    # ================================================================
-
-    def _tile_positions(
-        self,
-        width,
-        height,
-    ):
-
-        tile_w = min(
-            self.tile_size,
-            width,
-        )
-
-        tile_h = min(
-            self.tile_size,
-            height,
-        )
+    def _tile_positions(self, width, height):
+        tile_w = min(self.tile_size, width)
+        tile_h = min(self.tile_size, height)
 
         step_x = max(
             1,
-            int(
-                tile_w
-                *
-                (1.0 - self.tile_overlap)
-            ),
+            int(tile_w * (1.0 - self.tile_overlap)),
         )
 
         step_y = max(
             1,
-            int(
-                tile_h
-                *
-                (1.0 - self.tile_overlap)
-            ),
+            int(tile_h * (1.0 - self.tile_overlap)),
         )
 
         xs = list(
             range(
                 0,
-                max(
-                    1,
-                    width - tile_w + 1,
-                ),
+                max(1, width - tile_w + 1),
                 step_x,
             )
         )
@@ -380,23 +275,13 @@ class LeafSegmenter:
         ys = list(
             range(
                 0,
-                max(
-                    1,
-                    height - tile_h + 1,
-                ),
+                max(1, height - tile_h + 1),
                 step_y,
             )
         )
 
-        last_x = max(
-            0,
-            width - tile_w,
-        )
-
-        last_y = max(
-            0,
-            height - tile_h,
-        )
+        last_x = max(0, width - tile_w)
+        last_y = max(0, height - tile_h)
 
         if not xs or xs[-1] != last_x:
             xs.append(last_x)
@@ -408,16 +293,8 @@ class LeafSegmenter:
 
         for y in ys:
             for x in xs:
-
-                x2 = min(
-                    width,
-                    x + tile_w,
-                )
-
-                y2 = min(
-                    height,
-                    y + tile_h,
-                )
+                x2 = min(width, x + tile_w)
+                y2 = min(height, y + tile_h)
 
                 tiles.append(
                     (
@@ -428,30 +305,50 @@ class LeafSegmenter:
                     )
                 )
 
+        generated_count = len(tiles)
+        skipped_count = 0
+
+        if len(tiles) > self.max_tiles:
+            skipped_count = len(tiles) - self.max_tiles
+
+            step = len(tiles) / float(self.max_tiles)
+
+            selected = [
+                tiles[
+                    min(
+                        int(i * step),
+                        len(tiles) - 1,
+                    )
+                ]
+                for i in range(self.max_tiles)
+            ]
+
+            unique = []
+            seen = set()
+
+            for tile in selected:
+                if tile not in seen:
+                    unique.append(tile)
+                    seen.add(tile)
+
+            tiles = unique
+
+        self.last_tile_generation = {
+            "generated": generated_count,
+            "selected": len(tiles),
+            "skipped": skipped_count,
+        }
+
         return tiles
 
-    # ================================================================
-    # AUTOMATIC SAM
-    # ================================================================
-
-    def _run_sam(
-        self,
-        image,
-    ):
-
+    def _run_sam(self, image):
         return self.model.predict(
             source=image,
-            crop_n_layers=1,
-            points_stride=32,
             conf=self.sam_conf,
             verbose=False,
             imgsz=self.imgsz,
             retina_masks=True,
         )
-
-    # ================================================================
-    # EXTRACT AUTOMATIC MASKS
-    # ================================================================
 
     def _extract_candidates(
         self,
@@ -463,7 +360,6 @@ class LeafSegmenter:
         source_pass="full",
         tile_bbox=None,
     ):
-
         candidates = []
 
         if not results:
@@ -473,23 +369,18 @@ class LeafSegmenter:
             20,
             int(
                 full_width
-                *
-                full_height
-                *
-                self.min_area_ratio
+                * full_height
+                * self.min_area_ratio
             ),
         )
 
         max_area = int(
             full_width
-            *
-            full_height
-            *
-            self.max_area_ratio
+            * full_height
+            * self.max_area_ratio
         )
 
         for result in results:
-
             if result.masks is None:
                 continue
 
@@ -500,28 +391,20 @@ class LeafSegmenter:
             )
 
             if tile_bbox is None:
-
                 target_width = full_width
                 target_height = full_height
-
             else:
-
                 target_width = (
                     tile_bbox[2]
-                    -
-                    tile_bbox[0]
+                    - tile_bbox[0]
                 )
 
                 target_height = (
                     tile_bbox[3]
-                    -
-                    tile_bbox[1]
+                    - tile_bbox[1]
                 )
 
-            for source_index, mask in enumerate(
-                masks
-            ):
-
+            for source_index, mask in enumerate(masks):
                 mask = cv2.resize(
                     mask,
                     (
@@ -532,26 +415,15 @@ class LeafSegmenter:
                 )
 
                 mask_binary = (
-                    mask > 0.5
-                ).astype(
-                    np.uint8
-                ) * 255
-
-                mask_binary = (
-                    self.clean_mask(
-                        mask_binary
-                    )
+                    (mask > 0.5).astype(np.uint8)
+                    * 255
                 )
 
-                # ----------------------------------------------------
-                # Convert tile mask to original coordinates.
-                # ----------------------------------------------------
+                mask_binary = self.clean_mask(
+                    mask_binary
+                )
 
-                if (
-                    offset_x != 0
-                    or offset_y != 0
-                ):
-
+                if offset_x != 0 or offset_y != 0:
                     full_mask = np.zeros(
                         (
                             full_height,
@@ -560,9 +432,7 @@ class LeafSegmenter:
                         dtype=np.uint8,
                     )
 
-                    mh, mw = (
-                        mask_binary.shape
-                    )
+                    mh, mw = mask_binary.shape
 
                     x2 = min(
                         full_width,
@@ -591,9 +461,7 @@ class LeafSegmenter:
                     mask_binary = full_mask
 
                 area = int(
-                    np.count_nonzero(
-                        mask_binary
-                    )
+                    np.count_nonzero(mask_binary)
                 )
 
                 if area < min_area:
@@ -602,10 +470,8 @@ class LeafSegmenter:
                 if area > max_area:
                     continue
 
-                bbox = (
-                    self.bbox_from_mask(
-                        mask_binary
-                    )
+                bbox = self.bbox_from_mask(
+                    mask_binary
                 )
 
                 if bbox is None:
@@ -618,44 +484,24 @@ class LeafSegmenter:
                         "mask": mask_binary,
                         "bbox": bbox,
                         "area": area,
-                        "width": (
-                            x2 - x1 + 1
-                        ),
-                        "height": (
-                            y2 - y1 + 1
-                        ),
-                        "source_index": (
-                            source_index
-                        ),
-                        "source_pass": (
-                            source_pass
-                        ),
-                        "tile_bbox": (
-                            tile_bbox
-                        ),
+                        "width": x2 - x1 + 1,
+                        "height": y2 - y1 + 1,
+                        "source_index": source_index,
+                        "source_pass": source_pass,
+                        "tile_bbox": tile_bbox,
                         "prompt_score": 0.0,
                     }
                 )
 
         return candidates
 
-    # ================================================================
-    # GREEN / VEGETATION REGION
-    # ================================================================
-
     @staticmethod
-    def _green_region(
-        image,
-    ):
-
+    def _green_region(image):
         hsv = cv2.cvtColor(
             image,
             cv2.COLOR_BGR2HSV,
         )
 
-        # Intentionally broad.
-        # This is used only for finding seeds,
-        # NOT as the final leaf mask.
         lower = np.array(
             [20, 18, 12],
             dtype=np.uint8,
@@ -686,33 +532,16 @@ class LeafSegmenter:
 
         return green
 
-    # ================================================================
-    # DENSE INTERIOR POINT DISCOVERY
-    # ================================================================
-
     def _dense_leaf_points(
         self,
         image,
         existing_mask=None,
     ):
-        """
-        Find candidate points deep inside vegetation.
-
-        Distance Transform is used to prefer leaf interiors.
-
-        Important:
-        these points are independent prompts.
-        """
-
-        green = self._green_region(
-            image
-        )
+        green = self._green_region(image)
 
         if existing_mask is not None:
-
             existing_mask = (
-                (existing_mask > 0)
-                .astype(np.uint8)
+                (existing_mask > 0).astype(np.uint8)
                 * 255
             )
 
@@ -721,11 +550,7 @@ class LeafSegmenter:
                 existing_mask,
             )
 
-        binary = (
-            green > 0
-        ).astype(
-            np.uint8
-        )
+        binary = (green > 0).astype(np.uint8)
 
         if np.count_nonzero(binary) == 0:
             return []
@@ -736,33 +561,25 @@ class LeafSegmenter:
             5,
         )
 
-        maximum = float(
-            dist.max()
-        )
+        maximum = float(dist.max())
 
         if maximum <= 0:
             return []
 
-        # Lower threshold than V3:
-        # more candidate leaf interiors.
         peak_threshold = max(
             3.0,
             maximum * 0.18,
         )
 
         peaks = (
-            dist >= peak_threshold
-        ).astype(
-            np.uint8
+            (dist >= peak_threshold)
+            .astype(np.uint8)
         )
 
         peaks = cv2.morphologyEx(
             peaks,
             cv2.MORPH_OPEN,
-            np.ones(
-                (3, 3),
-                np.uint8,
-            ),
+            np.ones((3, 3), np.uint8),
         )
 
         count, labels, stats, centroids = (
@@ -774,11 +591,7 @@ class LeafSegmenter:
 
         points = []
 
-        for index in range(
-            1,
-            count,
-        ):
-
+        for index in range(1, count):
             area = stats[
                 index,
                 cv2.CC_STAT_AREA,
@@ -794,14 +607,11 @@ class LeafSegmenter:
 
             if not (
                 0 <= ix < dist.shape[1]
-                and
-                0 <= iy < dist.shape[0]
+                and 0 <= iy < dist.shape[0]
             ):
                 continue
 
-            strength = float(
-                dist[iy, ix]
-            )
+            strength = float(dist[iy, ix])
 
             points.append(
                 {
@@ -816,54 +626,26 @@ class LeafSegmenter:
             reverse=True,
         )
 
-        # ------------------------------------------------------------
-        # Spatial suppression.
-        #
-        # The old V3 configuration could suppress nearby leaves.
-        # Here the radius is deliberately smaller.
-        # ------------------------------------------------------------
-
         selected = []
 
         min_distance = max(
             12,
-            int(
-                self.prompt_stride
-                * 0.25
-            ),
+            int(self.prompt_stride * 0.25),
         )
 
         for point in points:
-
             too_close = False
 
             for existing in selected:
-
-                dx = (
-                    point["x"]
-                    -
-                    existing["x"]
-                )
-
-                dy = (
-                    point["y"]
-                    -
-                    existing["y"]
-                )
+                dx = point["x"] - existing["x"]
+                dy = point["y"] - existing["y"]
 
                 distance_sq = (
                     dx * dx
-                    +
-                    dy * dy
+                    + dy * dy
                 )
 
-                if (
-                    distance_sq
-                    <
-                    min_distance
-                    *
-                    min_distance
-                ):
+                if distance_sq < min_distance * min_distance:
                     too_close = True
                     break
 
@@ -872,17 +654,10 @@ class LeafSegmenter:
 
             selected.append(point)
 
-            if (
-                len(selected)
-                >= self.max_prompt_points
-            ):
+            if len(selected) >= self.max_prompt_points:
                 break
 
         return selected
-
-    # ================================================================
-    # INDEPENDENT SAM POINT PROMPT
-    # ================================================================
 
     def _run_single_point_prompt(
         self,
@@ -891,53 +666,29 @@ class LeafSegmenter:
         source_pass="prompt",
         tile_bbox=None,
     ):
-        """
-        Run ONE independent foreground prompt.
-
-        We deliberately do NOT send all points at once.
-
-        A multi-point SAM prompt can represent one object.
-        For leaf counting we need independent objects.
-        """
-
-        height, width = (
-            image.shape[:2]
-        )
+        height, width = image.shape[:2]
 
         x = float(point["x"])
         y = float(point["y"])
 
         try:
-
             results = self.model.predict(
                 source=image,
-
-                # IMPORTANT:
-                # one point = one independent prompt
-                points=[
-                    x,
-                    y,
-                ],
-
-                labels=[
-                    1,
-                ],
-
+                points=[x, y],
+                labels=[1],
                 verbose=False,
                 imgsz=self.imgsz,
                 retina_masks=True,
             )
 
         except Exception as exc:
-
             print(
-                "[LEAF SEGMENTER V5] "
+                "[LEAF SEGMENTER V6] "
                 f"Point prompt failed "
                 f"({int(x)},{int(y)}): "
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
-
             return []
 
         if not results:
@@ -946,7 +697,6 @@ class LeafSegmenter:
         candidates = []
 
         for result in results:
-
             if result.masks is None:
                 continue
 
@@ -972,10 +722,7 @@ class LeafSegmenter:
                 except Exception:
                     scores = None
 
-            for mask_index, mask in enumerate(
-                masks
-            ):
-
+            for mask_index, mask in enumerate(masks):
                 mask = cv2.resize(
                     mask,
                     (
@@ -986,46 +733,46 @@ class LeafSegmenter:
                 )
 
                 mask_binary = (
-                    mask > 0.5
-                ).astype(
-                    np.uint8
-                ) * 255
-
-                mask_binary = (
-                    self.clean_mask(
-                        mask_binary
-                    )
+                    (mask > 0.5).astype(np.uint8)
+                    * 255
                 )
 
+                mask_binary = self.clean_mask(
+                    mask_binary
+                )
+
+                point_x = int(round(x))
+                point_y = int(round(y))
+
+                if not (
+                    0 <= point_x < width
+                    and 0 <= point_y < height
+                ):
+                    continue
+
                 if mask_binary[
-                    int(round(y)),
-                    int(round(x))
+                    point_y,
+                    point_x
                 ] == 0:
                     continue
 
                 area = int(
-                    np.count_nonzero(
-                        mask_binary
-                    )
+                    np.count_nonzero(mask_binary)
                 )
 
                 min_area = max(
                     20,
                     int(
                         width
-                        *
-                        height
-                        *
-                        self.min_area_ratio
+                        * height
+                        * self.min_area_ratio
                     ),
                 )
 
                 max_area = int(
                     width
-                    *
-                    height
-                    *
-                    self.max_area_ratio
+                    * height
+                    * self.max_area_ratio
                 )
 
                 if area < min_area:
@@ -1034,10 +781,8 @@ class LeafSegmenter:
                 if area > max_area:
                     continue
 
-                bbox = (
-                    self.bbox_from_mask(
-                        mask_binary
-                    )
+                bbox = self.bbox_from_mask(
+                    mask_binary
                 )
 
                 if bbox is None:
@@ -1047,8 +792,7 @@ class LeafSegmenter:
 
                 if (
                     scores is not None
-                    and
-                    mask_index < len(scores)
+                    and mask_index < len(scores)
                 ):
                     score = float(
                         scores[mask_index]
@@ -1059,40 +803,17 @@ class LeafSegmenter:
                         "mask": mask_binary,
                         "bbox": bbox,
                         "area": area,
-                        "width": (
-                            bbox[2]
-                            -
-                            bbox[0]
-                            +
-                            1
-                        ),
-                        "height": (
-                            bbox[3]
-                            -
-                            bbox[1]
-                            +
-                            1
-                        ),
-                        "source_index": (
-                            mask_index
-                        ),
-                        "source_pass": (
-                            source_pass
-                        ),
-                        "tile_bbox": (
-                            tile_bbox
-                        ),
+                        "width": bbox[2] - bbox[0] + 1,
+                        "height": bbox[3] - bbox[1] + 1,
+                        "source_index": mask_index,
+                        "source_pass": source_pass,
+                        "tile_bbox": tile_bbox,
                         "prompt_score": score,
-                        "_prompt_x": int(
-                            round(x)
-                        ),
-                        "_prompt_y": int(
-                            round(y)
-                        ),
+                        "_prompt_x": point_x,
+                        "_prompt_y": point_y,
                     }
                 )
 
-        # Best mask first.
         candidates.sort(
             key=lambda c: (
                 c["prompt_score"],
@@ -1103,10 +824,6 @@ class LeafSegmenter:
 
         return candidates
 
-    # ================================================================
-    # POINT PROMPTS
-    # ================================================================
-
     def _run_point_prompts(
         self,
         image,
@@ -1114,23 +831,17 @@ class LeafSegmenter:
         source_pass="prompt",
         tile_bbox=None,
     ):
-        """
-        Run every point independently.
-
-        This is intentionally slower than a multi-point call,
-        but it is much safer for leaf counting.
-        """
-
         candidates = []
 
         for point_number, point in enumerate(
             points,
             start=1,
         ):
+            self._check_stop()
 
             if point_number % 10 == 0:
                 print(
-                    "[LEAF SEGMENTER V5] "
+                    "[LEAF SEGMENTER V6] "
                     f"Prompt {point_number}/"
                     f"{len(points)}",
                     flush=True,
@@ -1148,18 +859,11 @@ class LeafSegmenter:
             if not point_candidates:
                 continue
 
-            # For a leaf count we keep the best response for the prompt.
-            best = point_candidates[0]
-
             candidates.append(
-                best
+                point_candidates[0]
             )
 
         return candidates
-
-    # ================================================================
-    # SUSPICIOUS CLUMP
-    # ================================================================
 
     def _is_suspicious_clump(
         self,
@@ -1167,17 +871,11 @@ class LeafSegmenter:
         image_width,
         image_height,
     ):
-
-        image_area = (
-            image_width
-            *
-            image_height
-        )
+        image_area = image_width * image_height
 
         area_ratio = (
             candidate["area"]
-            /
-            float(image_area)
+            / float(image_area)
         )
 
         width = candidate["width"]
@@ -1185,64 +883,40 @@ class LeafSegmenter:
 
         aspect = (
             max(width, height)
-            /
-            max(
-                1,
-                min(width, height),
-            )
+            / max(1, min(width, height))
         )
 
-        # Large mask.
         if area_ratio > 0.020:
             return True
 
-        # Extremely elongated.
         if aspect > 4.5:
             return True
 
-        # Large horizontal clump.
         if (
             width > image_width * 0.35
-            and
-            height > image_height * 0.18
+            and height > image_height * 0.18
         ):
             return True
 
-        # Large vertical clump.
         if (
             height > image_height * 0.35
-            and
-            width > image_width * 0.18
+            and width > image_width * 0.18
         ):
             return True
 
         return False
-
-    # ================================================================
-    # CLUMP POINTS
-    # ================================================================
 
     def _clump_points(
         self,
         candidate,
         image,
     ):
-
-        x1, y1, x2, y2 = (
-            candidate["bbox"]
-        )
+        x1, y1, x2, y2 = candidate["bbox"]
 
         padding = 5
 
-        rx1 = max(
-            0,
-            x1 - padding,
-        )
-
-        ry1 = max(
-            0,
-            y1 - padding,
-        )
+        rx1 = max(0, x1 - padding)
+        ry1 = max(0, y1 - padding)
 
         rx2 = min(
             image.shape[1],
@@ -1259,86 +933,45 @@ class LeafSegmenter:
             rx1:rx2,
         ]
 
-        local_mask = candidate[
-            "mask"
-        ][
+        local_mask = candidate["mask"][
             ry1:ry2,
-            rx1:rx2
+            rx1:rx2,
         ]
 
-        local_points = (
-            self._dense_leaf_points(
-                region,
-                local_mask,
-            )
+        local_points = self._dense_leaf_points(
+            region,
+            local_mask,
         )
 
         points = []
 
         for point in local_points:
-
             points.append(
                 {
-                    "x": (
-                        point["x"]
-                        +
-                        rx1
-                    ),
-                    "y": (
-                        point["y"]
-                        +
-                        ry1
-                    ),
-                    "strength": (
-                        point["strength"]
-                    ),
+                    "x": point["x"] + rx1,
+                    "y": point["y"] + ry1,
+                    "strength": point["strength"],
                 }
             )
 
         return points
-
-    # ================================================================
-    # WATERSHED SPLITTING
-    # ================================================================
 
     def _watershed_split(
         self,
         mask,
         seed_points,
     ):
-        """
-        Split one large connected mask into several regions.
-
-        Used when SAM gives us something like:
-
-            [ 5 overlapping leaves ]
-
-        instead of:
-
-            [ leaf 1 ]
-            [ leaf 2 ]
-            [ leaf 3 ]
-            [ leaf 4 ]
-            [ leaf 5 ]
-        """
-
         if len(seed_points) < 2:
             return [mask]
 
         area = int(
-            np.count_nonzero(
-                mask > 0
-            )
+            np.count_nonzero(mask > 0)
         )
 
         if area < self.split_min_area:
             return [mask]
 
-        bbox = (
-            self.bbox_from_mask(
-                mask
-            )
-        )
+        bbox = self.bbox_from_mask(mask)
 
         if bbox is None:
             return [mask]
@@ -1347,12 +980,10 @@ class LeafSegmenter:
 
         local_mask = mask[
             y1:y2 + 1,
-            x1:x2 + 1
+            x1:x2 + 1,
         ]
 
-        local_h, local_w = (
-            local_mask.shape
-        )
+        local_h, local_w = local_mask.shape
 
         markers = np.zeros(
             (
@@ -1366,48 +997,29 @@ class LeafSegmenter:
         used = []
 
         for point in seed_points:
-
-            px = (
-                int(point["x"])
-                -
-                x1
-            )
-
-            py = (
-                int(point["y"])
-                -
-                y1
-            )
+            px = int(point["x"]) - x1
+            py = int(point["y"]) - y1
 
             if not (
                 0 <= px < local_w
-                and
-                0 <= py < local_h
+                and 0 <= py < local_h
             ):
                 continue
 
-            if local_mask[
-                py,
-                px
-            ] == 0:
+            if local_mask[py, px] == 0:
                 continue
 
-            # Prevent two markers at almost identical locations.
             too_close = False
 
             for ux, uy in used:
-
                 dx = px - ux
                 dy = py - uy
 
                 if (
                     dx * dx
-                    +
-                    dy * dy
-                    <
-                    self.split_min_seed_distance
-                    *
-                    self.split_min_seed_distance
+                    + dy * dy
+                    < self.split_min_seed_distance
+                    * self.split_min_seed_distance
                 ):
                     too_close = True
                     break
@@ -1419,46 +1031,26 @@ class LeafSegmenter:
                 2,
                 min(
                     6,
-                    int(
-                        point["strength"]
-                        * 0.18
-                    ),
+                    int(point["strength"] * 0.18),
                 ),
             )
 
             cv2.circle(
                 markers,
-                (
-                    px,
-                    py,
-                ),
+                (px, py),
                 radius,
                 marker_id,
                 -1,
             )
 
-            used.append(
-                (
-                    px,
-                    py,
-                )
-            )
-
+            used.append((px, py))
             marker_id += 1
 
         if marker_id <= 2:
             return [mask]
 
-        # ------------------------------------------------------------
-        # Distance transform.
-        # ------------------------------------------------------------
-
         dist = cv2.distanceTransform(
-            (
-                local_mask > 0
-            ).astype(
-                np.uint8
-            ),
+            (local_mask > 0).astype(np.uint8),
             cv2.DIST_L2,
             5,
         )
@@ -1472,11 +1064,8 @@ class LeafSegmenter:
             0,
             255,
             cv2.NORM_MINMAX,
-        ).astype(
-            np.uint8
-        )
+        ).astype(np.uint8)
 
-        # Make strong leaf interiors into watershed basins.
         watershed_gray = 255 - normalized
 
         pseudo = cv2.merge(
@@ -1487,10 +1076,6 @@ class LeafSegmenter:
             ]
         )
 
-        # ------------------------------------------------------------
-        # Watershed.
-        # ------------------------------------------------------------
-
         cv2.watershed(
             pseudo,
             markers,
@@ -1498,11 +1083,7 @@ class LeafSegmenter:
 
         pieces = []
 
-        for label in range(
-            1,
-            marker_id,
-        ):
-
+        for label in range(1, marker_id):
             piece_local = np.zeros(
                 (
                     local_h,
@@ -1516,22 +1097,12 @@ class LeafSegmenter:
             ] = 255
 
             piece_area = int(
-                np.count_nonzero(
-                    piece_local
-                )
+                np.count_nonzero(piece_local)
             )
 
-            # Tiny watershed fragments are discarded.
-            if (
-                piece_area
-                <
-                max(
-                    80,
-                    int(
-                        self.split_min_area
-                        * 0.20
-                    ),
-                )
+            if piece_area < max(
+                80,
+                int(self.split_min_area * 0.20),
             ):
                 continue
 
@@ -1545,19 +1116,12 @@ class LeafSegmenter:
                 x1:x2 + 1
             ] = piece_local
 
-            pieces.append(
-                piece
-            )
+            pieces.append(piece)
 
-        # If splitting failed, preserve the original candidate.
         if len(pieces) < 2:
             return [mask]
 
         return pieces
-
-    # ================================================================
-    # LEAF VALIDATION
-    # ================================================================
 
     def _is_reasonable_leaf(
         self,
@@ -1565,36 +1129,25 @@ class LeafSegmenter:
         image_shape,
         prompt_point=None,
     ):
-
-        height, width = (
-            image_shape[:2]
-        )
+        height, width = image_shape[:2]
 
         area = int(
-            np.count_nonzero(
-                mask > 0
-            )
+            np.count_nonzero(mask > 0)
         )
 
-        image_area = (
-            width
-            *
-            height
-        )
+        image_area = width * height
 
         min_area = max(
             80,
             int(
                 image_area
-                *
-                self.min_area_ratio
+                * self.min_area_ratio
             ),
         )
 
         max_area = int(
             image_area
-            *
-            self.max_area_ratio
+            * self.max_area_ratio
         )
 
         if area < min_area:
@@ -1603,89 +1156,41 @@ class LeafSegmenter:
         if area > max_area:
             return False
 
-        bbox = (
-            self.bbox_from_mask(
-                mask
-            )
-        )
+        bbox = self.bbox_from_mask(mask)
 
         if bbox is None:
             return False
 
         x1, y1, x2, y2 = bbox
 
-        bw = (
-            x2
-            -
-            x1
-            +
-            1
-        )
-
-        bh = (
-            y2
-            -
-            y1
-            +
-            1
-        )
+        bw = x2 - x1 + 1
+        bh = y2 - y1 + 1
 
         if bw < 8 or bh < 8:
             return False
 
         aspect = (
             max(bw, bh)
-            /
-            max(
-                1,
-                min(bw, bh),
-            )
+            / max(1, min(bw, bh))
         )
 
-        # Very thin shapes are generally stems/noise.
         if aspect > 8.0:
             return False
 
         if prompt_point is not None:
-
-            px = int(
-                prompt_point["x"]
-            )
-
-            py = int(
-                prompt_point["y"]
-            )
+            px = int(prompt_point["x"])
+            py = int(prompt_point["y"])
 
             if (
                 0 <= px < width
-                and
-                0 <= py < height
+                and 0 <= py < height
             ):
-
-                if mask[
-                    py,
-                    px
-                ] == 0:
+                if mask[py, px] == 0:
                     return False
 
         return True
 
-    # ================================================================
-    # DEDUPLICATION
-    # ================================================================
-
-    def _deduplicate(
-        self,
-        candidates,
-    ):
-        """
-        Remove duplicate detections.
-
-        IMPORTANT:
-        A small leaf inside a large coarse SAM mask is NOT automatically
-        considered a duplicate.
-        """
-
+    def _deduplicate(self, candidates):
         priority = {
             "prompt_clump": 5,
             "prompt": 4,
@@ -1717,49 +1222,25 @@ class LeafSegmenter:
         accepted = []
 
         for candidate in candidates:
-
             duplicate = False
 
             for existing in accepted:
-
-                # ----------------------------------------------------
-                # Fast bbox rejection.
-                # ----------------------------------------------------
-
-                bbox_overlap = (
-                    self.bbox_iou(
-                        candidate["bbox"],
-                        existing["bbox"],
-                    )
+                bbox_overlap = self.bbox_iou(
+                    candidate["bbox"],
+                    existing["bbox"],
                 )
 
                 if bbox_overlap <= 0:
                     continue
-
-                # ----------------------------------------------------
-                # Mask IoU.
-                # ----------------------------------------------------
 
                 iou = self.mask_iou(
                     candidate["mask"],
                     existing["mask"],
                 )
 
-                if (
-                    iou
-                    >=
-                    self.duplicate_iou
-                ):
+                if iou >= self.duplicate_iou:
                     duplicate = True
                     break
-
-                # ----------------------------------------------------
-                # Containment.
-                #
-                # Only compare containment if the areas are similar.
-                # This prevents a real small leaf from disappearing
-                # because it happens to be inside a large SAM mask.
-                # ----------------------------------------------------
 
                 area_small = min(
                     candidate["area"],
@@ -1773,17 +1254,10 @@ class LeafSegmenter:
 
                 area_ratio = (
                     area_small
-                    /
-                    float(
-                        max(
-                            1,
-                            area_large,
-                        )
-                    )
+                    / float(max(1, area_large))
                 )
 
                 if area_ratio >= 0.80:
-
                     containment_a = (
                         self.mask_containment(
                             candidate["mask"],
@@ -1799,33 +1273,18 @@ class LeafSegmenter:
                     )
 
                     if (
-                        containment_a
-                        >=
-                        self.containment
-                        or
-                        containment_b
-                        >=
-                        self.containment
+                        containment_a >= self.containment
+                        or containment_b >= self.containment
                     ):
                         duplicate = True
                         break
 
             if not duplicate:
-                accepted.append(
-                    candidate
-                )
+                accepted.append(candidate)
 
         return accepted
 
-    # ================================================================
-    # BUILD FINAL LEAF OBJECTS
-    # ================================================================
-
-    def _build_leaves(
-        self,
-        candidates,
-    ):
-
+    def _build_leaves(self, candidates):
         candidates.sort(
             key=lambda item: (
                 item["bbox"][1],
@@ -1839,84 +1298,35 @@ class LeafSegmenter:
             candidates,
             start=1,
         ):
+            mask = candidate["mask"]
 
-            mask = candidate[
-                "mask"
-            ]
-
-            ys, xs = np.where(
-                mask > 0
-            )
+            ys, xs = np.where(mask > 0)
 
             if len(xs) == 0:
                 continue
 
-            x1, y1, x2, y2 = (
-                candidate["bbox"]
-            )
+            x1, y1, x2, y2 = candidate["bbox"]
 
             leaves.append(
                 {
                     "id": leaf_number,
-
                     "source_index": (
-                        candidate[
-                            "source_index"
-                        ]
-                        + 1
+                        candidate["source_index"] + 1
                     ),
-
-                    # Full-resolution original-image mask.
                     "mask": mask,
-
-                    # Original-image coordinates.
                     "bbox": (
                         x1,
                         y1,
                         x2,
                         y2,
                     ),
-
-                    "area": int(
-                        candidate["area"]
-                    ),
-
-                    "width": (
-                        x2
-                        -
-                        x1
-                        +
-                        1
-                    ),
-
-                    "height": (
-                        y2
-                        -
-                        y1
-                        +
-                        1
-                    ),
-
-                    "center_x": float(
-                        xs.mean()
-                    ),
-
-                    "center_y": float(
-                        ys.mean()
-                    ),
-
-                    "source_pass": (
-                        candidate[
-                            "source_pass"
-                        ]
-                    ),
-
-                    "tile_bbox": (
-                        candidate.get(
-                            "tile_bbox"
-                        )
-                    ),
-
+                    "area": int(candidate["area"]),
+                    "width": x2 - x1 + 1,
+                    "height": y2 - y1 + 1,
+                    "center_x": float(xs.mean()),
+                    "center_y": float(ys.mean()),
+                    "source_pass": candidate["source_pass"],
+                    "tile_bbox": candidate.get("tile_bbox"),
                     "prompt_score": float(
                         candidate.get(
                             "prompt_score",
@@ -1926,7 +1336,6 @@ class LeafSegmenter:
                 }
             )
 
-        # Renumber after invalid candidates were removed.
         for leaf_number, leaf in enumerate(
             leaves,
             start=1,
@@ -1935,21 +1344,188 @@ class LeafSegmenter:
 
         return leaves
 
-    # ================================================================
-    # MAIN SEGMENTATION
-    # ================================================================
-
-    def segment(
+    def _split_candidate_if_needed(
         self,
-        image_path,
+        candidate,
+        image,
     ):
+        self._check_stop()
 
+        h, w = image.shape[:2]
+
+        if not self._is_suspicious_clump(
+            candidate,
+            w,
+            h,
+        ):
+            return [candidate]
+
+        points = self._clump_points(
+            candidate,
+            image,
+        )
+
+        if len(points) < 2:
+            return [candidate]
+
+        pieces = self._watershed_split(
+            candidate["mask"],
+            points,
+        )
+
+        if len(pieces) < 2:
+            return [candidate]
+
+        result = []
+
+        for index, piece in enumerate(pieces):
+            self._check_stop()
+
+            if not self._is_reasonable_leaf(
+                piece,
+                image.shape,
+            ):
+                continue
+
+            bbox = self.bbox_from_mask(piece)
+
+            if bbox is None:
+                continue
+
+            area = int(
+                np.count_nonzero(piece)
+            )
+
+            child = dict(candidate)
+
+            child.update(
+                {
+                    "mask": piece,
+                    "bbox": bbox,
+                    "area": area,
+                    "width": bbox[2] - bbox[0] + 1,
+                    "height": bbox[3] - bbox[1] + 1,
+                    "source_pass": "watershed",
+                    "source_index": index,
+                }
+            )
+
+            result.append(child)
+
+        if len(result) >= 2:
+            self.diagnostics["clump_candidates"] += 1
+            self.diagnostics["watershed_pieces"] += len(result)
+
+            return result
+
+        return [candidate]
+
+    def _remove_explained_parent_clumps(
+        self,
+        candidates,
+    ):
+        if len(candidates) < 3:
+            return candidates
+
+        ordered = sorted(
+            candidates,
+            key=lambda c: c.get("area", 0),
+            reverse=True,
+        )
+
+        removed = set()
+
+        for i, parent in enumerate(ordered):
+            self._check_stop()
+
+            if (
+                parent.get("area", 0)
+                < self.clump_min_area
+            ):
+                continue
+
+            parent_mask = parent["mask"] > 0
+
+            parent_area = max(
+                1,
+                int(
+                    np.count_nonzero(
+                        parent_mask
+                    )
+                ),
+            )
+
+            coverage_mask = np.zeros_like(
+                parent["mask"],
+                dtype=np.uint8,
+            )
+
+            child_count = 0
+
+            for j, child in enumerate(ordered):
+                if i == j:
+                    continue
+
+                if (
+                    child.get("area", 0)
+                    >= parent.get("area", 0)
+                ):
+                    continue
+
+                if (
+                    self.bbox_iou(
+                        parent["bbox"],
+                        child["bbox"],
+                    )
+                    <= 0
+                ):
+                    continue
+
+                if (
+                    self.mask_containment(
+                        child["mask"],
+                        parent["mask"],
+                    )
+                    >= 0.70
+                ):
+                    coverage_mask[
+                        child["mask"] > 0
+                    ] = 255
+
+                    child_count += 1
+
+                if (
+                    child_count
+                    >= self.parent_min_children
+                ):
+                    coverage = (
+                        np.count_nonzero(
+                            (
+                                coverage_mask > 0
+                            )
+                            & parent_mask
+                        )
+                        / float(parent_area)
+                    )
+
+                    if (
+                        coverage
+                        >= self.parent_coverage_threshold
+                    ):
+                        removed.add(id(parent))
+                        break
+
+        return [
+            c
+            for c in candidates
+            if id(c) not in removed
+        ]
+
+    def segment(self, image_path):
         if self.model is None:
             self.load_model()
 
-        image_path = Path(
-            image_path
-        )
+        image_path = Path(image_path)
 
         if not image_path.exists():
             raise FileNotFoundError(
@@ -1958,25 +1534,22 @@ class LeafSegmenter:
             )
 
         print(
-            "\n"
-            + "=" * 72,
+            "\n" + "=" * 72,
             flush=True,
         )
 
         print(
-            "[LEAF SEGMENTER V5] START",
+            "[LEAF SEGMENTER V6] START",
             flush=True,
         )
 
         print(
-            f"[LEAF SEGMENTER V5] "
+            "[LEAF SEGMENTER V6] "
             f"Image: {image_path}",
             flush=True,
         )
 
-        image = cv2.imread(
-            str(image_path)
-        )
+        image = cv2.imread(str(image_path))
 
         if image is None:
             raise ValueError(
@@ -1984,14 +1557,11 @@ class LeafSegmenter:
                 f"{image_path}"
             )
 
-        height, width = (
-            image.shape[:2]
-        )
+        height, width = image.shape[:2]
 
         print(
-            "[LEAF SEGMENTER V5] "
-            f"Image size: "
-            f"{width} x {height}",
+            "[LEAF SEGMENTER V6] "
+            f"Image size: {width} x {height}",
             flush=True,
         )
 
@@ -2002,76 +1572,99 @@ class LeafSegmenter:
             "prompt_candidates": 0,
             "clump_candidates": 0,
             "watershed_pieces": 0,
+            "tiles_generated": 0,
+            "tiles_found": 0,
+            "tiles_checked": 0,
+            "tiles_remaining": 0,
+            "tiles_skipped_by_limit": 0,
             "final_leaves": 0,
         }
 
         all_candidates = []
+        total_prompt_points_used = 0
 
-        # ============================================================
-        # PASS 1 — FULL IMAGE
-        # ============================================================
+        self.clear_stop()
 
         print(
-            "\n[LEAF SEGMENTER V5] "
+            "\n[LEAF SEGMENTER V6] "
             "PASS 1: FULL IMAGE",
             flush=True,
         )
 
         try:
+            full_results = self._run_sam(image)
 
-            full_results = (
-                self._run_sam(
-                    image
-                )
+            full_candidates = self._extract_candidates(
+                full_results,
+                width,
+                height,
+                source_pass="full",
+                tile_bbox=None,
             )
 
-            full_candidates = (
-                self._extract_candidates(
-                    full_results,
-                    width,
-                    height,
-                    source_pass="full",
-                    tile_bbox=None,
-                )
-            )
+            all_candidates.extend(full_candidates)
 
-            all_candidates.extend(
-                full_candidates
-            )
-
-            self.diagnostics[
-                "full_candidates"
-            ] = len(
-                full_candidates
+            self.diagnostics["full_candidates"] = (
+                len(full_candidates)
             )
 
             print(
-                "[LEAF SEGMENTER V5] "
-                f"Full candidates: "
-                f"{len(full_candidates)}",
+                "[LEAF SEGMENTER V6] "
+                f"Full candidates: {len(full_candidates)}",
                 flush=True,
             )
 
         except Exception as exc:
-
             print(
-                "[LEAF SEGMENTER V5] "
-                f"Full pass failed: {exc}",
+                "[LEAF SEGMENTER V6] "
+                f"Full pass failed: "
+                f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
-
-        # ============================================================
-        # PASS 2 — OVERLAPPING TILES
-        # ============================================================
 
         tiles = self._tile_positions(
             width,
             height,
         )
 
+        tile_info = self.last_tile_generation
+
+        total_tiles_generated = tile_info["generated"]
+        total_tiles_selected = tile_info["selected"]
+        total_tiles_skipped = tile_info["skipped"]
+
+        self.diagnostics["tiles_generated"] = (
+            total_tiles_generated
+        )
+
+        self.diagnostics["tiles_found"] = (
+            total_tiles_selected
+        )
+
+        self.diagnostics["tiles_checked"] = 0
+
+        self.diagnostics["tiles_remaining"] = (
+            total_tiles_selected
+        )
+
+        self.diagnostics["tiles_skipped_by_limit"] = (
+            total_tiles_skipped
+        )
+
         print(
-            "\n[LEAF SEGMENTER V5] "
-            f"PASS 2: {len(tiles)} TILES",
+            "\n[LEAF SEGMENTER V6] "
+            "PASS 2: TILE PLAN",
+            flush=True,
+        )
+
+        print(
+            "[LEAF SEGMENTER V6] "
+            f"TILE PLAN: "
+            f"GENERATED={total_tiles_generated} | "
+            f"FOUND={total_tiles_selected} | "
+            f"SKIPPED_BY_LIMIT={total_tiles_skipped} | "
+            f"CHECKED=0 | "
+            f"REMAINING={total_tiles_selected}",
             flush=True,
         )
 
@@ -2084,12 +1677,16 @@ class LeafSegmenter:
             tiles,
             start=1,
         ):
+            self._check_stop()
 
             print(
-                "[LEAF SEGMENTER V5] "
-                f"Tile {tile_number}/"
-                f"{len(tiles)} "
-                f"({x1},{y1})-({x2},{y2})",
+                "[LEAF SEGMENTER V6] "
+                f"TILE {tile_number}/{total_tiles_selected} "
+                f"START | "
+                f"CHECKED={tile_number - 1} | "
+                f"REMAINING="
+                f"{total_tiles_selected - (tile_number - 1)} | "
+                f"BOUNDS=({x1},{y1})-({x2},{y2})",
                 flush=True,
             )
 
@@ -2098,62 +1695,97 @@ class LeafSegmenter:
                 x1:x2,
             ]
 
+            tile_candidates = []
+
             try:
+                results = self._run_sam(tile)
 
-                results = (
-                    self._run_sam(
-                        tile
-                    )
-                )
-
-                tile_candidates = (
-                    self._extract_candidates(
-                        results,
-                        width,
-                        height,
-                        offset_x=x1,
-                        offset_y=y1,
-                        source_pass="tile",
-                        tile_bbox=(
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                        ),
-                    )
+                tile_candidates = self._extract_candidates(
+                    results,
+                    width,
+                    height,
+                    offset_x=x1,
+                    offset_y=y1,
+                    source_pass="tile",
+                    tile_bbox=(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                    ),
                 )
 
                 all_candidates.extend(
                     tile_candidates
                 )
 
-                self.diagnostics[
-                    "tile_candidates"
-                ] += len(
-                    tile_candidates
+                self.diagnostics["tile_candidates"] += (
+                    len(tile_candidates)
                 )
 
                 print(
-                    "[LEAF SEGMENTER V5] "
-                    f"Tile candidates: "
-                    f"{len(tile_candidates)}",
+                    "[LEAF SEGMENTER V6] "
+                    f"TILE {tile_number}/{total_tiles_selected} "
+                    f"DONE | "
+                    f"CHECKED={tile_number} | "
+                    f"REMAINING="
+                    f"{total_tiles_selected - tile_number} | "
+                    f"CANDIDATES={len(tile_candidates)}",
                     flush=True,
                 )
 
             except Exception as exc:
-
                 print(
-                    "[LEAF SEGMENTER V5] "
-                    f"Tile failed: {exc}",
+                    "[LEAF SEGMENTER V6] "
+                    f"TILE {tile_number}/{total_tiles_selected} "
+                    f"FAILED | "
+                    f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
 
-        # ============================================================
-        # PASS 3 — DENSE POINT RECOVERY
-        # ============================================================
+                print(
+                    "[LEAF SEGMENTER V6] "
+                    f"TILE {tile_number}/{total_tiles_selected} "
+                    f"CHECKED={tile_number} | "
+                    f"REMAINING="
+                    f"{total_tiles_selected - tile_number}",
+                    flush=True,
+                )
+
+            finally:
+                self.diagnostics["tiles_checked"] = (
+                    tile_number
+                )
+
+                self.diagnostics["tiles_remaining"] = (
+                    total_tiles_selected - tile_number
+                )
+
+                print(
+                    "[LEAF SEGMENTER V6] "
+                    f"TILES STATUS: "
+                    f"FOUND={total_tiles_selected} | "
+                    f"CHECKED="
+                    f"{self.diagnostics['tiles_checked']} | "
+                    f"REMAINING="
+                    f"{self.diagnostics['tiles_remaining']}",
+                    flush=True,
+                )
 
         print(
-            "\n[LEAF SEGMENTER V5] "
+            "\n[LEAF SEGMENTER V6] "
+            "TILES SUMMARY: "
+            f"GENERATED={self.diagnostics['tiles_generated']} | "
+            f"FOUND={self.diagnostics['tiles_found']} | "
+            f"CHECKED={self.diagnostics['tiles_checked']} | "
+            f"REMAINING={self.diagnostics['tiles_remaining']} | "
+            f"SKIPPED_BY_LIMIT="
+            f"{self.diagnostics['tiles_skipped_by_limit']}",
+            flush=True,
+        )
+
+        print(
+            "\n[LEAF SEGMENTER V6] "
             "PASS 3: DENSE POINT RECOVERY",
             flush=True,
         )
@@ -2167,35 +1799,47 @@ class LeafSegmenter:
             tiles,
             start=1,
         ):
+            self._check_stop()
 
             tile = image[
                 y1:y2,
                 x1:x2,
             ]
 
-            points = (
-                self._dense_leaf_points(
-                    tile
-                )
+            points = self._dense_leaf_points(tile)
+
+            remaining_budget = (
+                self.max_total_prompt_points
+                - total_prompt_points_used
             )
+
+            if remaining_budget <= 0:
+                break
+
+            points = points[
+                :min(
+                    len(points),
+                    remaining_budget,
+                )
+            ]
 
             if not points:
                 continue
 
-            self.diagnostics[
-                "prompt_points"
-            ] += len(points)
+            total_prompt_points_used += len(points)
+
+            self.diagnostics["prompt_points"] += (
+                len(points)
+            )
 
             print(
-                "[LEAF SEGMENTER V5] "
+                "[LEAF SEGMENTER V6] "
                 f"Tile {tile_number}: "
-                f"{len(points)} "
-                f"interior points",
+                f"{len(points)} interior points",
                 flush=True,
             )
 
             try:
-
                 prompt_candidates = (
                     self._run_point_prompts(
                         tile,
@@ -2210,21 +1854,12 @@ class LeafSegmenter:
                     )
                 )
 
-                self.diagnostics[
-                    "prompt_candidates"
-                ] += len(
-                    prompt_candidates
+                self.diagnostics["prompt_candidates"] += (
+                    len(prompt_candidates)
                 )
 
-                # Convert local tile masks to
-                # original-image coordinates.
-                for candidate in (
-                    prompt_candidates
-                ):
-
-                    local_mask = candidate[
-                        "mask"
-                    ]
+                for candidate in prompt_candidates:
+                    local_mask = candidate["mask"]
 
                     full_mask = np.zeros(
                         (
@@ -2234,79 +1869,67 @@ class LeafSegmenter:
                         dtype=np.uint8,
                     )
 
-                    mh, mw = (
-                        local_mask.shape
+                    mh, mw = local_mask.shape
+
+                    target_y2 = min(
+                        height,
+                        y1 + mh,
                     )
 
+                    target_x2 = min(
+                        width,
+                        x1 + mw,
+                    )
+
+                    if (
+                        target_x2 <= x1
+                        or target_y2 <= y1
+                    ):
+                        continue
+
                     full_mask[
-                        y1:y1 + mh,
-                        x1:x1 + mw
-                    ] = local_mask
+                        y1:target_y2,
+                        x1:target_x2
+                    ] = local_mask[
+                        :target_y2 - y1,
+                        :target_x2 - x1
+                    ]
 
-                    candidate[
-                        "mask"
-                    ] = full_mask
+                    candidate["mask"] = full_mask
 
-                    bbox = (
-                        self.bbox_from_mask(
-                            full_mask
-                        )
+                    bbox = self.bbox_from_mask(
+                        full_mask
                     )
 
                     if bbox is None:
                         continue
 
-                    candidate[
-                        "bbox"
-                    ] = bbox
+                    candidate["bbox"] = bbox
 
-                    candidate[
-                        "area"
-                    ] = int(
-                        np.count_nonzero(
-                            full_mask
-                        )
+                    candidate["area"] = int(
+                        np.count_nonzero(full_mask)
                     )
 
-                    candidate[
-                        "width"
-                    ] = (
-                        bbox[2]
-                        -
-                        bbox[0]
-                        +
-                        1
+                    candidate["width"] = (
+                        bbox[2] - bbox[0] + 1
                     )
 
-                    candidate[
-                        "height"
-                    ] = (
-                        bbox[3]
-                        -
-                        bbox[1]
-                        +
-                        1
+                    candidate["height"] = (
+                        bbox[3] - bbox[1] + 1
                     )
 
-                    all_candidates.append(
-                        candidate
-                    )
+                    all_candidates.append(candidate)
 
             except Exception as exc:
-
                 print(
-                    "[LEAF SEGMENTER V5] "
+                    "[LEAF SEGMENTER V6] "
                     f"Prompt recovery failed: "
-                    f"{exc}",
+                    f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
 
-        # ============================================================
-        # PASS 4 — CLUMP DETECTION + INDIVIDUAL LEAF SPLITTING
-        # ============================================================
-
         print(
-            "\n[LEAF SEGMENTER V5] "
+            "\n[LEAF SEGMENTER V6] "
             "PASS 4: CLUMP SPLITTING",
             flush=True,
         )
@@ -2316,7 +1939,7 @@ class LeafSegmenter:
         )
 
         print(
-            "[LEAF SEGMENTER V5] "
+            "[LEAF SEGMENTER V6] "
             f"Candidates before clump splitting: "
             f"{len(prefiltered)}",
             flush=True,
@@ -2328,6 +1951,8 @@ class LeafSegmenter:
             prefiltered,
             start=1,
         ):
+            self._check_stop()
+
             pieces = self._split_candidate_if_needed(
                 candidate,
                 image,
@@ -2335,29 +1960,22 @@ class LeafSegmenter:
 
             if len(pieces) > 1:
                 print(
-                    "[LEAF SEGMENTER V5] "
+                    "[LEAF SEGMENTER V6] "
                     f"Candidate {candidate_number} "
                     f"split into {len(pieces)} leaves",
                     flush=True,
                 )
 
-            final_candidates.extend(
-                pieces
-            )
+            final_candidates.extend(pieces)
 
-        # Remove whole-bush/parent masks when individual children
-        # already explain enough of their area.
         final_candidates = (
             self._remove_explained_parent_clumps(
                 final_candidates
             )
         )
 
-        # FINAL DEDUP
-        # ============================================================
-
         print(
-            "\n[LEAF SEGMENTER V5] "
+            "\n[LEAF SEGMENTER V6] "
             "FINAL DEDUPLICATION",
             flush=True,
         )
@@ -2366,58 +1984,43 @@ class LeafSegmenter:
             final_candidates
         )
 
-        # One more parent-clump cleanup after deduplication.
         filtered = (
             self._remove_explained_parent_clumps(
                 filtered
             )
         )
 
-        # ============================================================
-        # FINAL LEAVES
-        # ============================================================
-
-        leaves = (
-            self._build_leaves(
-                filtered
-            )
+        leaves = self._build_leaves(
+            filtered
         )
 
-        self.diagnostics[
-            "final_leaves"
-        ] = len(
-            leaves
+        self.diagnostics["final_leaves"] = (
+            len(leaves)
         )
 
         print(
-            "\n"
-            + "=" * 72,
+            "\n" + "=" * 72,
             flush=True,
         )
 
         print(
-            "[LEAF SEGMENTER V5] "
-            "FINAL RESULT",
+            "[LEAF SEGMENTER V6] FINAL RESULT",
             flush=True,
         )
 
         print(
-            "[LEAF SEGMENTER V5] "
-            f"LEAVES DETECTED: "
-            f"{len(leaves)}",
+            "[LEAF SEGMENTER V6] "
+            f"LEAVES DETECTED: {len(leaves)}",
             flush=True,
         )
 
         print(
-            "[LEAF SEGMENTER V5] "
+            "[LEAF SEGMENTER V6] "
             "Diagnostics:",
             flush=True,
         )
 
-        for key, value in (
-            self.diagnostics.items()
-        ):
-
+        for key, value in self.diagnostics.items():
             print(
                 f"    {key}: {value}",
                 flush=True,
@@ -2428,14 +2031,9 @@ class LeafSegmenter:
             flush=True,
         )
 
-        # ------------------------------------------------------------
-        # Leaf list.
-        # ------------------------------------------------------------
-
         for leaf in leaves:
-
             print(
-                "[LEAF SEGMENTER V5] "
+                "[LEAF SEGMENTER V6] "
                 f"Leaf {leaf['id']:03d} "
                 f"bbox={leaf['bbox']} "
                 f"area={leaf['area']} "
@@ -2449,33 +2047,20 @@ class LeafSegmenter:
         return leaves
 
 
-# ====================================================================
-# DIRECT TEST
-# ====================================================================
-
 if __name__ == "__main__":
+    PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-    # ---------------------------------------------------------------
-    # First test the image you are currently using.
-    # ---------------------------------------------------------------
-
-    IMAGE_PATH = Path(
-        r"C:\paprika\images\test.jpg"
+    IMAGE_PATH = (
+        PROJECT_ROOT
+        / "images"
+        / "test.jpg"
     )
 
     MODEL_CANDIDATES = [
-        Path(
-            r"C:\paprika\images\sam2.1_b.pt"
-        ),
-        Path(
-            r"C:\paprika\models\sam2.1_b.pt"
-        ),
-        Path(
-            r"C:\paprika\images\sam2_b.pt"
-        ),
-        Path(
-            r"C:\paprika\models\sam2_b.pt"
-        ),
+        PROJECT_ROOT / "images" / "sam2.1_b.pt",
+        PROJECT_ROOT / "models" / "sam2.1_b.pt",
+        PROJECT_ROOT / "images" / "sam2_b.pt",
+        PROJECT_ROOT / "models" / "sam2_b.pt",
     ]
 
     MODEL_PATH = next(
@@ -2488,55 +2073,33 @@ if __name__ == "__main__":
     )
 
     if MODEL_PATH is None:
-
         raise FileNotFoundError(
             "Could not find SAM2 model.\n\n"
             "Checked:\n"
-            +
-            "\n".join(
+            + "\n".join(
                 str(path)
                 for path in MODEL_CANDIDATES
             )
         )
 
     if not IMAGE_PATH.exists():
-
         raise FileNotFoundError(
             "Test image not found:\n"
             f"{IMAGE_PATH}"
         )
 
-    # ---------------------------------------------------------------
-    # V4 configuration
-    # ---------------------------------------------------------------
-
     segmenter = LeafSegmenter(
-
         model_path=MODEL_PATH,
-
-        # Dense overlapping tiles.
         tile_size=1024,
         tile_overlap=0.35,
-
-        # Preserve small leaves.
         min_area_ratio=0.00002,
-
-        # Never accept a giant bush as one leaf.
         max_area_ratio=0.30,
-
-        # Duplicate control.
         duplicate_iou=0.82,
         containment=0.94,
-
-        # SAM.
         imgsz=1024,
         sam_conf=0.10,
-
-        # More interior seeds.
         prompt_stride=72,
         max_prompt_points=220,
-
-        # Clump splitting.
         split_min_area=700,
         split_min_seed_distance=24,
     )
@@ -2546,8 +2109,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "\n"
-        + "=" * 72,
+        "\n" + "=" * 72,
         flush=True,
     )
 

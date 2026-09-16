@@ -18,13 +18,20 @@ from PySide6.QtWidgets import (
 )
 
 
-RESULTS_ROOT = Path(
-    r"C:\paprika\results\segmentation"
-)
+# ============================================================
+# PAPRIKA PROJECT PATHS
+# ============================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+RESULTS_ROOT = PROJECT_ROOT / "results" / "segmentation"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def get_creation_time(file_path):
-
     try:
         created_timestamp = file_path.stat().st_ctime
 
@@ -38,6 +45,10 @@ def get_creation_time(file_path):
         return "UNKNOWN"
 
 
+# ============================================================
+# LEAF PREVIEW LABEL
+# ============================================================
+
 class LeafPreviewLabel(QLabel):
 
     double_clicked = Signal()
@@ -49,6 +60,10 @@ class LeafPreviewLabel(QLabel):
 
         super().mouseDoubleClickEvent(event)
 
+
+# ============================================================
+# FULL IMAGE VIEWER
+# ============================================================
 
 class FullImageViewer(QWidget):
 
@@ -62,7 +77,12 @@ class FullImageViewer(QWidget):
         super().__init__()
 
         self.image_path = Path(image_path)
-        self.mask_path = Path(mask_path) if mask_path else None
+
+        self.mask_path = (
+            Path(mask_path)
+            if mask_path
+            else None
+        )
 
         self.setWindowTitle(
             title_text
@@ -99,7 +119,8 @@ class FullImageViewer(QWidget):
 
         info = QLabel(
             (
-                f"CREATED: {get_creation_time(self.image_path)}"
+                f"CREATED: "
+                f"{get_creation_time(self.image_path)}"
             )
         )
 
@@ -112,9 +133,13 @@ class FullImageViewer(QWidget):
         )
 
         image_scroll = QScrollArea()
-        image_scroll.setWidgetResizable(False)
+
+        image_scroll.setWidgetResizable(
+            False
+        )
 
         image_label = QLabel()
+
         image_label.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
@@ -124,13 +149,20 @@ class FullImageViewer(QWidget):
         )
 
         if pixmap.isNull():
+
             image_label.setText(
-                f"Could not load image:\n{self.image_path}"
+                (
+                    "Could not load image:\n"
+                    f"{self.image_path}"
+                )
             )
+
         else:
+
             image_label.setPixmap(
                 pixmap
             )
+
             image_label.adjustSize()
 
         image_scroll.setWidget(
@@ -142,11 +174,18 @@ class FullImageViewer(QWidget):
             1
         )
 
-        if self.mask_path is not None and self.mask_path.exists():
+        # ----------------------------------------------------
+        # MASK
+        # ----------------------------------------------------
+
+        if (
+            self.mask_path is not None
+            and self.mask_path.exists()
+        ):
 
             mask_title = QLabel(
                 (
-                    f"MASK    |    CREATED: "
+                    "MASK    |    CREATED: "
                     f"{get_creation_time(self.mask_path)}"
                 )
             )
@@ -164,8 +203,13 @@ class FullImageViewer(QWidget):
             )
 
             mask_scroll = QScrollArea()
-            mask_scroll.setWidgetResizable(False)
+
+            mask_scroll.setWidgetResizable(
+                False
+            )
+
             mask_label = QLabel()
+
             mask_label.setAlignment(
                 Qt.AlignmentFlag.AlignCenter
             )
@@ -175,13 +219,20 @@ class FullImageViewer(QWidget):
             )
 
             if mask_pixmap.isNull():
+
                 mask_label.setText(
-                    f"Could not load mask:\n{self.mask_path}"
+                    (
+                        "Could not load mask:\n"
+                        f"{self.mask_path}"
+                    )
                 )
+
             else:
+
                 mask_label.setPixmap(
                     mask_pixmap
                 )
+
                 mask_label.adjustSize()
 
             mask_scroll.setWidget(
@@ -193,6 +244,10 @@ class FullImageViewer(QWidget):
                 1
             )
 
+
+# ============================================================
+# SEGMENTATION RESULTS - RUN LIST
+# ============================================================
 
 class SegmentationResults(QWidget):
 
@@ -212,6 +267,7 @@ class SegmentationResults(QWidget):
         self.run_viewer = None
 
         self.create_ui()
+
         self.load_runs()
 
     def create_ui(self):
@@ -245,6 +301,7 @@ class SegmentationResults(QWidget):
         )
 
         self.run_list = QListWidget()
+
         self.run_list.setMinimumHeight(
             150
         )
@@ -315,16 +372,27 @@ class SegmentationResults(QWidget):
             self.load_runs
         )
 
+    # --------------------------------------------------------
+    # LOAD RUNS
+    # --------------------------------------------------------
+
     def load_runs(self):
 
         self.run_list.clear()
-        self.open_button.setEnabled(False)
+
+        self.open_button.setEnabled(
+            False
+        )
 
         if not RESULTS_ROOT.exists():
 
             self.status_label.setText(
-                "No segmentation runs found."
+                (
+                    "No segmentation runs found.\n"
+                    f"Results path: {RESULTS_ROOT}"
+                )
             )
+
             return
 
         run_directories = sorted(
@@ -342,13 +410,14 @@ class SegmentationResults(QWidget):
             self.status_label.setText(
                 "No segmentation runs found."
             )
+
             return
 
         for run_directory in run_directories:
 
             item_text = (
                 f"{run_directory.name}"
-                f"    |    CREATED: "
+                "    |    CREATED: "
                 f"{get_creation_time(run_directory)}"
             )
 
@@ -366,14 +435,26 @@ class SegmentationResults(QWidget):
             )
 
         self.status_label.setText(
-            f"Found {len(run_directories)} segmentation runs."
+            (
+                f"Found "
+                f"{len(run_directories)} "
+                f"segmentation runs."
+            )
         )
+
+    # --------------------------------------------------------
+    # RUN SELECTION
+    # --------------------------------------------------------
 
     def on_run_selected(self):
 
         self.open_button.setEnabled(
             self.run_list.currentItem() is not None
         )
+
+    # --------------------------------------------------------
+    # OPEN RUN
+    # --------------------------------------------------------
 
     def open_selected_run(self):
 
@@ -391,9 +472,15 @@ class SegmentationResults(QWidget):
         )
 
         self.run_viewer.show()
+
         self.run_viewer.raise_()
+
         self.run_viewer.activateWindow()
 
+
+# ============================================================
+# SEGMENTATION RUN VIEWER
+# ============================================================
 
 class SegmentationRunViewer(QWidget):
 
@@ -423,7 +510,12 @@ class SegmentationRunViewer(QWidget):
         )
 
         self.create_ui()
+
         self.load_run()
+
+    # --------------------------------------------------------
+    # CREATE UI
+    # --------------------------------------------------------
 
     def create_ui(self):
 
@@ -514,6 +606,10 @@ class SegmentationRunViewer(QWidget):
             3
         )
 
+        # ----------------------------------------------------
+        # LEAVES
+        # ----------------------------------------------------
+
         leaves_title = QLabel(
             "LEAVES"
         )
@@ -527,12 +623,15 @@ class SegmentationRunViewer(QWidget):
         )
 
         self.leaves_scroll = QScrollArea()
+
         self.leaves_scroll.setWidgetResizable(
             True
         )
+
         self.leaves_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
+
         self.leaves_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
@@ -573,6 +672,10 @@ class SegmentationRunViewer(QWidget):
             hint
         )
 
+    # --------------------------------------------------------
+    # IMAGE PANEL
+    # --------------------------------------------------------
+
     def create_image_panel(
         self,
         title_text,
@@ -580,9 +683,11 @@ class SegmentationRunViewer(QWidget):
     ):
 
         panel = QFrame()
+
         panel.setFrameShape(
             QFrame.Shape.Box
         )
+
         panel.setMinimumWidth(
             520
         )
@@ -608,16 +713,20 @@ class SegmentationRunViewer(QWidget):
         )
 
         image_label = QLabel()
+
         image_label.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
+
         image_label.setMinimumHeight(
             280
         )
+
         image_label.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding
         )
+
         image_label.setStyleSheet(
             "border: 1px solid gray;"
         )
@@ -628,6 +737,7 @@ class SegmentationRunViewer(QWidget):
         )
 
         info_label = QLabel()
+
         info_label.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
@@ -636,7 +746,15 @@ class SegmentationRunViewer(QWidget):
             info_label
         )
 
-        return image_label, info_label, panel
+        return (
+            image_label,
+            info_label,
+            panel
+        )
+
+    # --------------------------------------------------------
+    # LOAD RUN
+    # --------------------------------------------------------
 
     def load_run(self):
 
@@ -660,21 +778,37 @@ class SegmentationRunViewer(QWidget):
             / "masks"
         )
 
-        original_files = sorted(
-            [
-                path
-                for path in original_directory.iterdir()
-                if path.is_file()
-            ]
-        ) if original_directory.exists() else []
+        # ----------------------------------------------------
+        # ORIGINAL
+        # ----------------------------------------------------
 
-        roi_files = sorted(
-            [
-                path
-                for path in roi_directory.iterdir()
-                if path.is_file()
-            ]
-        ) if roi_directory.exists() else []
+        original_files = (
+            sorted(
+                [
+                    path
+                    for path in original_directory.iterdir()
+                    if path.is_file()
+                ]
+            )
+            if original_directory.exists()
+            else []
+        )
+
+        # ----------------------------------------------------
+        # ROI
+        # ----------------------------------------------------
+
+        roi_files = (
+            sorted(
+                [
+                    path
+                    for path in roi_directory.iterdir()
+                    if path.is_file()
+                ]
+            )
+            if roi_directory.exists()
+            else []
+        )
 
         if original_files:
 
@@ -690,10 +824,14 @@ class SegmentationRunViewer(QWidget):
             self.original_info_label.setText(
                 (
                     f"FILE: {original_path.name}"
-                    f"    |    CREATED: "
+                    "    |    CREATED: "
                     f"{get_creation_time(original_path)}"
                 )
             )
+
+        # ----------------------------------------------------
+        # ROI
+        # ----------------------------------------------------
 
         if roi_files:
 
@@ -709,7 +847,7 @@ class SegmentationRunViewer(QWidget):
             self.region_info_label.setText(
                 (
                     f"FILE: {roi_path.name}"
-                    f"    |    CREATED: "
+                    "    |    CREATED: "
                     f"{get_creation_time(roi_path)}"
                 )
             )
@@ -721,40 +859,66 @@ class SegmentationRunViewer(QWidget):
             )
 
             if original_files:
+
                 self.region_info_label.setText(
                     (
                         "Analysis region: FULL IMAGE"
-                        f"    |    CREATED: "
+                        "    |    CREATED: "
                         f"{get_creation_time(original_files[0])}"
                     )
                 )
 
-        leaf_files = sorted(
-            leaves_directory.glob(
-                "leaf_*.png"
-            ),
-            key=lambda path: path.name
-        ) if leaves_directory.exists() else []
+        # ----------------------------------------------------
+        # LEAVES
+        # ----------------------------------------------------
 
-        mask_files = sorted(
-            masks_directory.glob(
-                "mask_*.png"
-            ),
-            key=lambda path: path.name
-        ) if masks_directory.exists() else []
+        leaf_files = (
+            sorted(
+                leaves_directory.glob(
+                    "leaf_*.png"
+                ),
+                key=lambda path: path.name
+            )
+            if leaves_directory.exists()
+            else []
+        )
+
+        # ----------------------------------------------------
+        # MASKS
+        # ----------------------------------------------------
+
+        mask_files = (
+            sorted(
+                masks_directory.glob(
+                    "mask_*.png"
+                ),
+                key=lambda path: path.name
+            )
+            if masks_directory.exists()
+            else []
+        )
 
         mask_map = {
             path.stem.replace(
                 "mask_",
                 ""
             ): path
+
             for path in mask_files
         }
+
+        # ----------------------------------------------------
+        # NO LEAVES
+        # ----------------------------------------------------
 
         if not leaf_files:
 
             message = QLabel(
-                "No individual leaf results found."
+                (
+                    "No individual leaf results found.\n\n"
+                    f"Expected folder:\n"
+                    f"{leaves_directory}"
+                )
             )
 
             message.setAlignment(
@@ -766,6 +930,10 @@ class SegmentationRunViewer(QWidget):
             )
 
             return
+
+        # ----------------------------------------------------
+        # ADD LEAF CARDS
+        # ----------------------------------------------------
 
         for leaf_path in leaf_files:
 
@@ -787,6 +955,10 @@ class SegmentationRunViewer(QWidget):
         self.leaves_layout.addStretch(
             1
         )
+
+    # --------------------------------------------------------
+    # SHOW IMAGE
+    # --------------------------------------------------------
 
     def show_image(
         self,
@@ -815,12 +987,16 @@ class SegmentationRunViewer(QWidget):
             width,
             height,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.SmoothTransformation
         )
 
         label.setPixmap(
             scaled
         )
+
+    # --------------------------------------------------------
+    # LEAF CARD
+    # --------------------------------------------------------
 
     def add_leaf_card(
         self,
@@ -899,7 +1075,7 @@ class SegmentationRunViewer(QWidget):
 
         created_label = QLabel(
             (
-                f"CREATED: "
+                "CREATED: "
                 f"{get_creation_time(leaf_path)}"
             )
         )
@@ -912,15 +1088,25 @@ class SegmentationRunViewer(QWidget):
             created_label
         )
 
+        double_click_label = QLabel(
+            "DOUBLE-CLICK TO OPEN"
+        )
+
+        double_click_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
         layout.addWidget(
-            QLabel(
-                "DOUBLE-CLICK TO OPEN"
-            )
+            double_click_label
         )
 
         self.leaves_layout.addWidget(
             frame
         )
+
+    # --------------------------------------------------------
+    # FULL SIZE LEAF
+    # --------------------------------------------------------
 
     def open_leaf_full_size(
         self,
@@ -939,23 +1125,39 @@ class SegmentationRunViewer(QWidget):
         )
 
         self.full_viewer.show()
+
         self.full_viewer.raise_()
+
         self.full_viewer.activateWindow()
 
-    def closeEvent(self, event):
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    def closeEvent(
+        self,
+        event
+    ):
 
         if self.full_viewer is not None:
+
             self.full_viewer.close()
+
             self.full_viewer = None
 
         event.accept()
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 
     app = QApplication([])
 
     window = SegmentationResults()
+
     window.show()
 
     app.exec()

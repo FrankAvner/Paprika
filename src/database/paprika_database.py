@@ -2,9 +2,9 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-DATABASE_PATH = Path(r"C:\paprika\data\paprika.db")
-
+DATABASE_PATH = PROJECT_ROOT / "data" / "paprika.db"
 
 class PaprikaDatabase:
 
