@@ -16,9 +16,7 @@ from PySide6.QtCore import (
     Signal,
     QTimer,
 )
-
 from PySide6.QtGui import QPixmap
-
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -31,11 +29,11 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QTextEdit,
     QSizePolicy,
+    QInputDialog,
 )
 
 
 UI_DIR = Path(__file__).resolve().parent
-
 ANALYSIS_DIR = UI_DIR.parent / "analysis"
 DATABASE_DIR = UI_DIR.parent / "database"
 
@@ -49,17 +47,22 @@ if str(UI_DIR) not in sys.path:
     sys.path.insert(0, str(UI_DIR))
 
 
-from leaf_segmentation.leaf_segmenter import LeafSegmenter, SegmentationStopped
+from leaf_segmentation.leaf_segmenter import LeafSegmenter
+    
+from leaf_quality.rank_leaf_quality import LeafQualityRanker
 from roi_selector import ROISelector
 from database_service import DatabaseService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 MODEL_PATH = PROJECT_ROOT / "images" / "sam2.1_b.pt"
 
 RESULTS_ROOT = PROJECT_ROOT / "results" / "segmentation"
 
-PERFORMANCE_HISTORY_FILE = RESULTS_ROOT / "performance_history.json"
+PERFORMANCE_HISTORY_FILE = (
+    RESULTS_ROOT / "performance_history.json"
+)
 
 INITIAL_BASELINE_SECONDS = 169.67
 INITIAL_BASELINE_PIXELS = 546 * 572
@@ -71,13 +74,14 @@ class PerformanceHistory:
         self.history_file = Path(history_file)
 
     def load(self):
+
         if not self.history_file.exists():
             return []
 
         try:
             with self.history_file.open(
                 "r",
-                encoding="utf-8"
+                encoding="utf-8",
             ) as file:
                 data = json.load(file)
 
@@ -88,7 +92,7 @@ class PerformanceHistory:
             print(
                 "[PERFORMANCE HISTORY] "
                 f"Could not load history: {exc}",
-                flush=True
+                flush=True,
             )
 
         return []
@@ -99,11 +103,12 @@ class PerformanceHistory:
         extension,
         width,
         height,
-        duration_seconds
+        duration_seconds,
     ):
+
         self.history_file.parent.mkdir(
             parents=True,
-            exist_ok=True
+            exist_ok=True,
         )
 
         history = self.load()
@@ -116,10 +121,12 @@ class PerformanceHistory:
             "extension": extension,
             "width": width,
             "height": height,
-            "megapixels": (width * height) / 1_000_000,
+            "megapixels": (
+                width * height
+            ) / 1_000_000,
             "duration_seconds": round(
                 duration_seconds,
-                3
+                3,
             ),
         }
 
@@ -127,13 +134,13 @@ class PerformanceHistory:
 
         with self.history_file.open(
             "w",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as file:
             json.dump(
                 history,
                 file,
                 indent=4,
-                ensure_ascii=False
+                ensure_ascii=False,
             )
 
     def estimate_duration(
@@ -141,14 +148,19 @@ class PerformanceHistory:
         model_name,
         extension,
         width,
-        height
+        height,
     ):
-        megapixels = (width * height) / 1_000_000
+
+        megapixels = (
+            width * height
+        ) / 1_000_000
 
         history = self.load()
+
         relevant = []
 
         for entry in history:
+
             if entry.get("model") != model_name:
                 continue
 
@@ -156,7 +168,9 @@ class PerformanceHistory:
                 continue
 
             entry_mp = entry.get("megapixels")
-            entry_duration = entry.get("duration_seconds")
+            entry_duration = entry.get(
+                "duration_seconds"
+            )
 
             if not entry_mp:
                 continue
@@ -164,31 +178,66 @@ class PerformanceHistory:
             if not entry_duration:
                 continue
 
-            normalized_time = entry_duration / entry_mp
+            normalized_time = (
+                entry_duration / entry_mp
+            )
+
             relevant.append(normalized_time)
 
         if relevant:
+
             seconds_per_mp = median(relevant)
-            estimated = seconds_per_mp * megapixels
-            return max(estimated, 1.0)
 
-        baseline_mp = INITIAL_BASELINE_PIXELS / 1_000_000
-        baseline_seconds_per_mp = INITIAL_BASELINE_SECONDS / baseline_mp
-        estimated = baseline_seconds_per_mp * megapixels
+            estimated = (
+                seconds_per_mp * megapixels
+            )
 
-        return max(estimated, 1.0)
+            return max(
+                estimated,
+                1.0,
+            )
+
+        baseline_mp = (
+            INITIAL_BASELINE_PIXELS
+            / 1_000_000
+        )
+
+        baseline_seconds_per_mp = (
+            INITIAL_BASELINE_SECONDS
+            / baseline_mp
+        )
+
+        estimated = (
+            baseline_seconds_per_mp
+            * megapixels
+        )
+
+        return max(
+            estimated,
+            1.0,
+        )
 
 
 class ActivityStream(io.TextIOBase):
-    """Mirror stdout/stderr to the original terminal and Activity Log."""
+    """
+    Mirror stdout/stderr to the original terminal
+    and Activity Log.
+    """
 
-    def __init__(self, original_stream, callback):
+    def __init__(
+        self,
+        original_stream,
+        callback,
+    ):
+
         super().__init__()
+
         self.original_stream = original_stream
         self.callback = callback
         self._buffer = ""
 
     def write(self, text):
+
         if not text:
             return 0
 
@@ -198,18 +247,31 @@ class ActivityStream(io.TextIOBase):
         self._buffer += text
 
         while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
+
+            line, self._buffer = (
+                self._buffer.split(
+                    "\n",
+                    1,
+                )
+            )
+
             line = line.rstrip("\r")
+
             if line.strip():
                 self.callback(line)
 
         return len(text)
 
     def flush(self):
+
         self.original_stream.flush()
 
         if self._buffer.strip():
-            self.callback(self._buffer.rstrip("\r"))
+
+            self.callback(
+                self._buffer.rstrip("\r")
+            )
+
             self._buffer = ""
 
     def isatty(self):
@@ -230,64 +292,99 @@ class SegmentationWorker(QObject):
         self,
         image_path,
         model_path,
-        roi_rect=None
+        roi_rect=None,
     ):
+
         super().__init__()
 
         self.image_path = Path(image_path)
         self.model_path = Path(model_path)
+
         self.roi_rect = roi_rect
+
         self.stop_requested = False
+
         self.segmenter = None
 
         self.media_id = None
         self.run_id = None
+        self.run_name = None
+
         self.database_service = DatabaseService()
+
         self.worker_start_time = None
 
     def log(self, message):
+
         print(
             f"[SEGMENTATION WORKER] {message}",
-            flush=True
+            flush=True,
         )
 
     def request_stop(self):
+
         self.stop_requested = True
-        self.log("STOP requested by user.")
+
+        self.log(
+            "STOP requested by user."
+        )
+
         if self.segmenter is not None:
             self.segmenter.request_stop()
 
-    def update_database_status(self, status):
+    def update_database_status(
+        self,
+        status,
+    ):
+
         if self.run_id is None:
             return
 
         if self.worker_start_time is not None:
+
             duration = (
-                datetime.now() - self.worker_start_time
+                datetime.now()
+                - self.worker_start_time
             ).total_seconds()
+
         else:
             duration = 0
 
         try:
+
             self.database_service.update_run(
                 self.run_id,
                 status=status,
-                duration_seconds=duration
+                duration_seconds=duration,
             )
+
         except Exception as exc:
+
             print(
                 "[DATABASE] "
-                f"Failed to update run status to {status}: {exc}",
-                flush=True
+                f"Failed to update run status "
+                f"to {status}: {exc}",
+                flush=True,
             )
 
     def check_stop(self):
+
         if self.stop_requested:
-            self.update_database_status("stopped")
+
+            self.update_database_status(
+                "stopped"
+            )
 
             self.busy.emit(False)
-            self.stage.emit("SEGMENTATION STOPPED BY USER")
-            self.log("Segmentation stopped.")
+
+            self.stage.emit(
+                "SEGMENTATION STOPPED BY USER"
+            )
+
+            self.log(
+                "Segmentation stopped."
+            )
+
             self.cancelled.emit()
 
             return True
@@ -295,9 +392,10 @@ class SegmentationWorker(QObject):
         return False
 
     def create_run_directory(self):
+
         RESULTS_ROOT.mkdir(
             parents=True,
-            exist_ok=True
+            exist_ok=True,
         )
 
         base_name = self.image_path.stem
@@ -306,13 +404,17 @@ class SegmentationWorker(QObject):
             "%Y%m%d_%H%M%S_%f"
         )
 
-        run_name = f"{base_name}_{timestamp}"
+        run_name = (
+            f"{base_name}_{timestamp}"
+        )
 
-        run_directory = RESULTS_ROOT / run_name
+        run_directory = (
+            RESULTS_ROOT / run_name
+        )
 
         run_directory.mkdir(
             parents=True,
-            exist_ok=False
+            exist_ok=False,
         )
 
         for directory_name in (
@@ -322,11 +424,12 @@ class SegmentationWorker(QObject):
             "overlay",
             "roi",
         ):
+
             (
                 run_directory / directory_name
             ).mkdir(
                 parents=True,
-                exist_ok=True
+                exist_ok=True,
             )
 
         destination = (
@@ -339,53 +442,94 @@ class SegmentationWorker(QObject):
 
         shutil.copy2(
             self.image_path,
-            destination
+            destination,
         )
 
         self.log(
-            f"Run directory created: {run_directory}"
+            "Run directory created: "
+            f"{run_directory}"
         )
 
         return run_directory
 
-    def prepare_input(self, image, run_directory):
+    def prepare_input(
+        self,
+        image,
+        run_directory,
+    ):
+
         height, width = image.shape[:2]
 
         if self.roi_rect is None:
+
             return (
                 image,
                 0,
                 0,
                 width,
                 height,
-                None
+                None,
             )
 
         x1, y1, x2, y2 = self.roi_rect
 
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(x1, min(x2, width - 1))
-        y2 = max(y1, min(y2, height - 1))
+        x1 = max(
+            0,
+            min(x1, width - 1),
+        )
 
-        roi = image[y1:y2 + 1, x1:x2 + 1]
+        y1 = max(
+            0,
+            min(y1, height - 1),
+        )
+
+        x2 = max(
+            x1,
+            min(x2, width - 1),
+        )
+
+        y2 = max(
+            y1,
+            min(y2, height - 1),
+        )
+
+        roi = image[
+            y1:y2 + 1,
+            x1:x2 + 1,
+        ]
 
         if roi.size == 0:
-            raise ValueError("Selected ROI is empty.")
+            raise ValueError(
+                "Selected ROI is empty."
+            )
 
-        roi_path = run_directory / "roi" / "roi.png"
+        roi_path = (
+            run_directory
+            / "roi"
+            / "roi.png"
+        )
 
-        if not cv2.imwrite(str(roi_path), roi):
+        if not cv2.imwrite(
+            str(roi_path),
+            roi,
+        ):
+
             raise IOError(
-                f"Failed to save ROI:\n{roi_path}"
+                f"Failed to save ROI:\n"
+                f"{roi_path}"
             )
 
         self.log("ROI selected.")
+
         self.log(
-            f"ROI coordinates: ({x1},{y1}) - ({x2},{y2})"
+            "ROI coordinates: "
+            f"({x1},{y1}) - ({x2},{y2})"
         )
+
         self.log(
-            f"ROI size: {x2 - x1 + 1} x {y2 - y1 + 1}"
+            "ROI size: "
+            f"{x2 - x1 + 1} x "
+            f"{y2 - y1 + 1}"
         )
 
         return (
@@ -394,60 +538,87 @@ class SegmentationWorker(QObject):
             y1,
             x2 - x1 + 1,
             y2 - y1 + 1,
-            roi_path
+            roi_path,
         )
 
     def create_database_records(
         self,
         full_width,
-        full_height
+        full_height,
     ):
-        self.worker_start_time = datetime.now()
 
-        now = datetime.now()
-        file_stat = self.image_path.stat()
-
-        file_created_at = datetime.fromtimestamp(
-            file_stat.st_ctime
-        ).isoformat(timespec="seconds")
-
-        file_modified_at = datetime.fromtimestamp(
-            file_stat.st_mtime
-        ).isoformat(timespec="seconds")
-
-        capture_date = now.strftime("%Y-%m-%d")
-        capture_time = now.strftime("%H:%M:%S")
-
-        self.media_id = self.database_service.database.create_media(
-            file_name=self.image_path.name,
-            file_path=str(self.image_path),
-            file_type="image",
-            extension=self.image_path.suffix.lower(),
-            width=full_width,
-            height=full_height,
-            capture_date=capture_date,
-            capture_time=capture_time,
-            file_created_at=file_created_at,
-            file_modified_at=file_modified_at,
+        self.worker_start_time = (
+            datetime.now()
         )
 
-        self.run_id = self.database_service.create_run(
-            run_name=self.run_name,
-            media_id=self.media_id,
-            source_file=self.image_path.name,
-            source_path=str(self.image_path),
-            capture_date=capture_date,
-            capture_time=capture_time,
-            image_width=full_width,
-            image_height=full_height,
-            roi=self.roi_rect,
+        now = datetime.now()
+
+        file_stat = self.image_path.stat()
+
+        file_created_at = (
+            datetime.fromtimestamp(
+                file_stat.st_ctime
+            ).isoformat(
+                timespec="seconds"
+            )
+        )
+
+        file_modified_at = (
+            datetime.fromtimestamp(
+                file_stat.st_mtime
+            ).isoformat(
+                timespec="seconds"
+            )
+        )
+
+        capture_date = now.strftime(
+            "%Y-%m-%d"
+        )
+
+        capture_time = now.strftime(
+            "%H:%M:%S"
+        )
+
+        self.media_id = (
+            self.database_service.database.create_media(
+                file_name=self.image_path.name,
+                file_path=str(
+                    self.image_path
+                ),
+                file_type="image",
+                extension=self.image_path.suffix.lower(),
+                width=full_width,
+                height=full_height,
+                capture_date=capture_date,
+                capture_time=capture_time,
+                file_created_at=file_created_at,
+                file_modified_at=file_modified_at,
+            )
+        )
+
+        self.run_id = (
+            self.database_service.create_run(
+                run_name=self.run_name,
+                media_id=self.media_id,
+                source_file=self.image_path.name,
+                source_path=str(
+                    self.image_path
+                ),
+                capture_date=capture_date,
+                capture_time=capture_time,
+                image_width=full_width,
+                image_height=full_height,
+                roi=self.roi_rect,
+            )
         )
 
         self.database_service.update_run(
             self.run_id,
             model_name=self.model_path.name,
-            model_path=str(self.model_path),
-            status="running"
+            model_path=str(
+                self.model_path
+            ),
+            status="running",
         )
 
         self.log(
@@ -462,38 +633,49 @@ class SegmentationWorker(QObject):
         offset_x,
         offset_y,
         full_width,
-        full_height
+        full_height,
     ):
+
         roi_mask = leaf["mask"]
 
-        roi_height, roi_width = roi_mask.shape[:2]
+        roi_height, roi_width = (
+            roi_mask.shape[:2]
+        )
 
         import numpy as np
 
         full_mask = np.zeros(
-            (full_height, full_width),
-            dtype=roi_mask.dtype
+            (
+                full_height,
+                full_width,
+            ),
+            dtype=roi_mask.dtype,
         )
 
         paste_height = min(
             roi_height,
-            full_height - offset_y
+            full_height - offset_y,
         )
 
         paste_width = min(
             roi_width,
-            full_width - offset_x
+            full_width - offset_x,
         )
 
-        if paste_height <= 0 or paste_width <= 0:
+        if (
+            paste_height <= 0
+            or paste_width <= 0
+        ):
             return None
 
         full_mask[
-            offset_y:offset_y + paste_height,
-            offset_x:offset_x + paste_width
+            offset_y:
+            offset_y + paste_height,
+            offset_x:
+            offset_x + paste_width,
         ] = roi_mask[
             :paste_height,
-            :paste_width
+            :paste_width,
         ]
 
         x1, y1, x2, y2 = leaf["bbox"]
@@ -503,66 +685,143 @@ class SegmentationWorker(QObject):
         x2 += offset_x
         y2 += offset_y
 
-        x1 = max(0, min(x1, full_width - 1))
-        y1 = max(0, min(y1, full_height - 1))
-        x2 = max(x1, min(x2, full_width - 1))
-        y2 = max(y1, min(y2, full_height - 1))
+        x1 = max(
+            0,
+            min(
+                x1,
+                full_width - 1,
+            ),
+        )
 
-        area = int((full_mask > 0).sum())
+        y1 = max(
+            0,
+            min(
+                y1,
+                full_height - 1,
+            ),
+        )
+
+        x2 = max(
+            x1,
+            min(
+                x2,
+                full_width - 1,
+            ),
+        )
+
+        y2 = max(
+            y1,
+            min(
+                y2,
+                full_height - 1,
+            ),
+        )
+
+        area = int(
+            (full_mask > 0).sum()
+        )
 
         converted = dict(leaf)
+
         converted["mask"] = full_mask
-        converted["bbox"] = (x1, y1, x2, y2)
+
+        converted["bbox"] = (
+            x1,
+            y1,
+            x2,
+            y2,
+        )
+
         converted["area"] = area
-        converted["width"] = x2 - x1 + 1
-        converted["height"] = y2 - y1 + 1
-        converted["center_x"] = (x1 + x2) / 2.0
-        converted["center_y"] = (y1 + y2) / 2.0
+
+        converted["width"] = (
+            x2 - x1 + 1
+        )
+
+        converted["height"] = (
+            y2 - y1 + 1
+        )
+
+        converted["center_x"] = (
+            x1 + x2
+        ) / 2.0
+
+        converted["center_y"] = (
+            y1 + y2
+        ) / 2.0
 
         return converted
 
-    def _emit_activity_line(self, line):
+    def _emit_activity_line(
+        self,
+        line,
+    ):
+
         if line:
             self.activity.emit(line)
 
     def run(self):
-        original_stdout = sys.__stdout__ or sys.stdout
-        original_stderr = sys.__stderr__ or sys.stderr
+
+        original_stdout = (
+            sys.__stdout__ or sys.stdout
+        )
+
+        original_stderr = (
+            sys.__stderr__ or sys.stderr
+        )
 
         stdout_stream = ActivityStream(
             original_stdout,
-            self._emit_activity_line
+            self._emit_activity_line,
         )
+
         stderr_stream = ActivityStream(
             original_stderr,
-            self._emit_activity_line
+            self._emit_activity_line,
         )
 
         try:
-            with contextlib.redirect_stdout(stdout_stream), \
-                 contextlib.redirect_stderr(stderr_stream):
+
+            with contextlib.redirect_stdout(
+                stdout_stream
+            ), contextlib.redirect_stderr(
+                stderr_stream
+            ):
+
                 self._run_internal()
+
         finally:
+
             stdout_stream.flush()
             stderr_stream.flush()
 
     def _run_internal(self):
+
         try:
+
             self.stage.emit(
                 "STEP 1/8 - Checking input image..."
             )
 
-            image = cv2.imread(str(self.image_path))
+            image = cv2.imread(
+                str(self.image_path)
+            )
 
             if image is None:
+
                 raise ValueError(
-                    f"Could not read image:\n{self.image_path}"
+                    "Could not read image:\n"
+                    f"{self.image_path}"
                 )
 
-            full_height, full_width = image.shape[:2]
+            full_height, full_width = (
+                image.shape[:2]
+            )
 
             self.log(
-                f"Image size: {full_width} x {full_height}"
+                "Image size: "
+                f"{full_width} x "
+                f"{full_height}"
             )
 
             self.progress.emit(5)
@@ -575,8 +834,10 @@ class SegmentationWorker(QObject):
             )
 
             if not self.model_path.exists():
+
                 raise FileNotFoundError(
-                    f"SAM 2 model not found:\n{self.model_path}"
+                    "SAM 2 model not found:\n"
+                    f"{self.model_path}"
                 )
 
             self.progress.emit(10)
@@ -588,8 +849,13 @@ class SegmentationWorker(QObject):
                 "STEP 3/8 - Creating result directory..."
             )
 
-            run_directory = self.create_run_directory()
-            self.run_name = run_directory.name
+            run_directory = (
+                self.create_run_directory()
+            )
+
+            self.run_name = (
+                run_directory.name
+            )
 
             self.progress.emit(15)
 
@@ -606,23 +872,29 @@ class SegmentationWorker(QObject):
                 offset_y,
                 analysis_width,
                 analysis_height,
-                roi_path
+                roi_path,
             ) = self.prepare_input(
                 image,
-                run_directory
+                run_directory,
             )
 
             if self.roi_rect is not None:
+
                 self.stage.emit(
                     "ROI selected - "
-                    f"{analysis_width} x {analysis_height}"
+                    f"{analysis_width} x "
+                    f"{analysis_height}"
                 )
+
             else:
-                self.stage.emit("Full image selected.")
+
+                self.stage.emit(
+                    "Full image selected."
+                )
 
             self.create_database_records(
                 full_width,
-                full_height
+                full_height,
             )
 
             self.progress.emit(20)
@@ -635,7 +907,9 @@ class SegmentationWorker(QObject):
             )
 
             self.segmenter = LeafSegmenter(
-                model_path=str(self.model_path),
+                model_path=str(
+                    self.model_path
+                ),
                 tile_size=1024,
                 tile_overlap=0.35,
                 min_area_ratio=0.00002,
@@ -666,12 +940,21 @@ class SegmentationWorker(QObject):
             self.busy.emit(True)
 
             if self.roi_rect is None:
-                segmentation_input_path = self.image_path
+
+                segmentation_input_path = (
+                    self.image_path
+                )
+
             else:
-                segmentation_input_path = roi_path
+
+                segmentation_input_path = (
+                    roi_path
+                )
 
             leaves = self.segmenter.segment(
-                str(segmentation_input_path)
+                str(
+                    segmentation_input_path
+                )
             )
 
             self.busy.emit(False)
@@ -682,16 +965,21 @@ class SegmentationWorker(QObject):
             converted_leaves = []
 
             for leaf in leaves:
-                converted = self.convert_leaf_to_original(
-                    leaf,
-                    offset_x,
-                    offset_y,
-                    full_width,
-                    full_height
+
+                converted = (
+                    self.convert_leaf_to_original(
+                        leaf,
+                        offset_x,
+                        offset_y,
+                        full_width,
+                        full_height,
+                    )
                 )
 
                 if converted is not None:
-                    converted_leaves.append(converted)
+                    converted_leaves.append(
+                        converted
+                    )
 
             leaves = converted_leaves
 
@@ -715,14 +1003,19 @@ class SegmentationWorker(QObject):
 
             overlay = image.copy()
 
-            for index, leaf in enumerate(leaves):
+            for index, leaf in enumerate(
+                leaves
+            ):
+
                 if self.check_stop():
                     return
 
                 leaf_id = leaf["id"]
 
                 message = (
-                    f"Processing mask {index + 1}/{total_masks}"
+                    f"Processing mask "
+                    f"{index + 1}/"
+                    f"{total_masks}"
                 )
 
                 self.stage.emit(message)
@@ -730,16 +1023,26 @@ class SegmentationWorker(QObject):
 
                 mask = leaf["mask"]
 
-                colored_mask = (image * 0).astype(image.dtype)
+                colored_mask = (
+                    image * 0
+                ).astype(
+                    image.dtype
+                )
 
-                colored_mask[mask > 0] = (0, 255, 0)
+                colored_mask[
+                    mask > 0
+                ] = (
+                    0,
+                    255,
+                    0,
+                )
 
                 overlay = cv2.addWeighted(
                     overlay,
                     0.70,
                     colored_mask,
                     0.30,
-                    0
+                    0,
                 )
 
                 mask_path = (
@@ -748,16 +1051,27 @@ class SegmentationWorker(QObject):
                     / f"mask_{leaf_id:03d}.png"
                 )
 
-                if not cv2.imwrite(str(mask_path), mask):
+                if not cv2.imwrite(
+                    str(mask_path),
+                    mask,
+                ):
+
                     raise IOError(
-                        f"Failed to save mask:\n{mask_path}"
+                        "Failed to save mask:\n"
+                        f"{mask_path}"
                     )
 
-                x1, y1, x2, y2 = leaf["bbox"]
+                x1, y1, x2, y2 = (
+                    leaf["bbox"]
+                )
 
-                crop = image[y1:y2 + 1, x1:x2 + 1]
+                crop = image[
+                    y1:y2 + 1,
+                    x1:x2 + 1,
+                ]
 
                 if crop.size > 0:
+
                     leaf_path = (
                         run_directory
                         / "leaves"
@@ -766,24 +1080,33 @@ class SegmentationWorker(QObject):
 
                     if not cv2.imwrite(
                         str(leaf_path),
-                        crop
+                        crop,
                     ):
+
                         raise IOError(
-                            f"Failed to save leaf:\n{leaf_path}"
+                            "Failed to save leaf:\n"
+                            f"{leaf_path}"
                         )
 
                 progress = (
                     65
                     + int(
                         (
-                            (index + 1)
-                            / max(total_masks, 1)
+                            (
+                                index + 1
+                            )
+                            / max(
+                                total_masks,
+                                1,
+                            )
                         )
                         * 20
                     )
                 )
 
-                self.progress.emit(progress)
+                self.progress.emit(
+                    progress
+                )
 
             if self.check_stop():
                 return
@@ -800,27 +1123,39 @@ class SegmentationWorker(QObject):
 
             if not cv2.imwrite(
                 str(overlay_path),
-                overlay
+                overlay,
             ):
+
                 raise IOError(
-                    f"Failed to save overlay:\n{overlay_path}"
+                    "Failed to save overlay:\n"
+                    f"{overlay_path}"
                 )
 
-            self.update_database_status("completed")
+            self.update_database_status(
+                "completed"
+            )
 
             self.progress.emit(100)
 
             completed_message = (
-                f"COMPLETED - {total_masks} masks"
+                f"COMPLETED - "
+                f"{total_masks} masks"
             )
 
-            self.stage.emit(completed_message)
+            self.stage.emit(
+                completed_message
+            )
 
             self.finished.emit(
                 {
                     "mask_count": total_masks,
-                    "run_directory": str(run_directory),
-                    "overlay": str(overlay_path),
+                    "leaves": leaves,
+                    "run_directory": str(
+                        run_directory
+                    ),
+                    "overlay": str(
+                        overlay_path
+                    ),
                     "width": analysis_width,
                     "height": analysis_height,
                     "full_width": full_width,
@@ -831,144 +1166,395 @@ class SegmentationWorker(QObject):
                 }
             )
 
-        except SegmentationStopped:
+        except InterruptedError:
+
             self.busy.emit(False)
-            self.update_database_status("stopped")
-            self.stage.emit("SEGMENTATION STOPPED BY USER")
+
+            self.update_database_status(
+                "stopped"
+            )
+
+            self.stage.emit(
+                "SEGMENTATION STOPPED BY USER"
+            )
+
             self.cancelled.emit()
 
         except Exception as exc:
+
             self.busy.emit(False)
 
-            self.update_database_status("failed")
+            self.update_database_status(
+                "failed"
+            )
 
             error_type = type(exc).__name__
+
             error_message = str(exc)
-            full_traceback = traceback.format_exc()
+
+            full_traceback = (
+                traceback.format_exc()
+            )
 
             print("", flush=True)
-            print("=" * 80, flush=True)
-            print("LEAF SEGMENTATION ERROR", flush=True)
-            print(f"ERROR TYPE: {error_type}", flush=True)
-            print(f"ERROR MESSAGE: {error_message}", flush=True)
-            print("-" * 80, flush=True)
-            print(full_traceback, flush=True)
-            print("=" * 80, flush=True)
+
+            print(
+                "=" * 80,
+                flush=True,
+            )
+
+            print(
+                "LEAF SEGMENTATION ERROR",
+                flush=True,
+            )
+
+            print(
+                f"ERROR TYPE: {error_type}",
+                flush=True,
+            )
+
+            print(
+                f"ERROR MESSAGE: {error_message}",
+                flush=True,
+            )
+
+            print(
+                "-" * 80,
+                flush=True,
+            )
+
+            print(
+                full_traceback,
+                flush=True,
+            )
+
+            print(
+                "=" * 80,
+                flush=True,
+            )
 
             self.error.emit(
                 error_type,
-                f"ERROR MESSAGE:\n{error_message}\n\n"
-                f"FULL TRACEBACK:\n{full_traceback}"
+                (
+                    "ERROR MESSAGE:\n"
+                    f"{error_message}\n\n"
+                    "FULL TRACEBACK:\n"
+                    f"{full_traceback}"
+                ),
+            )
+
+
+class LeafQualityWorker(QObject):
+
+    progress = Signal(int)
+    finished = Signal(object)
+    error = Signal(str, str)
+    activity = Signal(str)
+
+    def __init__(
+        self,
+        image_path,
+        selected_leaves,
+    ):
+
+        super().__init__()
+
+        self.image_path = Path(
+            image_path
+        )
+
+        self.selected_leaves = (
+            selected_leaves
+        )
+
+    def run(self):
+
+        try:
+
+            print(
+                "[LEAF QUALITY] "
+                "Starting quality analysis...",
+                flush=True,
+            )
+
+            self.activity.emit(
+                "Starting leaf quality analysis..."
+            )
+
+            total = len(
+                self.selected_leaves
+            )
+
+            self.progress.emit(10)
+
+            ranker = LeafQualityRanker()
+
+            ranked_leaves = (
+                ranker.rank_image_path(
+                    str(self.image_path),
+                    self.selected_leaves,
+                )
+            )
+
+            self.progress.emit(100)
+
+            self.activity.emit(
+                "Leaf quality analysis completed - "
+                f"{len(ranked_leaves)} leaves"
+            )
+
+            self.finished.emit(
+                {
+                    "leaves": ranked_leaves,
+                    "count": len(
+                        ranked_leaves
+                    ),
+                }
+            )
+
+        except Exception as exc:
+
+            error_type = type(exc).__name__
+
+            full_traceback = (
+                traceback.format_exc()
+            )
+
+            print("", flush=True)
+
+            print(
+                "=" * 80,
+                flush=True,
+            )
+
+            print(
+                "LEAF QUALITY ERROR",
+                flush=True,
+            )
+
+            print(
+                f"ERROR TYPE: {error_type}",
+                flush=True,
+            )
+
+            print(
+                f"ERROR MESSAGE: {exc}",
+                flush=True,
+            )
+
+            print(
+                "-" * 80,
+                flush=True,
+            )
+
+            print(
+                full_traceback,
+                flush=True,
+            )
+
+            print(
+                "=" * 80,
+                flush=True,
+            )
+
+            self.error.emit(
+                error_type,
+                (
+                    "ERROR MESSAGE:\n"
+                    f"{exc}\n\n"
+                    "FULL TRACEBACK:\n"
+                    f"{full_traceback}"
+                ),
             )
 
 
 class ImageAnalysis(QWidget):
 
     def __init__(self):
+
         super().__init__()
 
         self.setWindowTitle(
             "PAPRIKA - IMAGE ANALYSIS"
         )
 
-        self.resize(1000, 700)
+        self.resize(
+            1000,
+            700,
+        )
 
         self.selected_image = None
+
         self.original_image_width = None
         self.original_image_height = None
+
         self.roi_rect = None
+
         self._preview_pixmap = QPixmap()
 
+        # Segmentation thread
         self.thread = None
         self.worker = None
+
+        # Quality-check thread
+        self.quality_thread = None
+        self.quality_worker = None
+
+        # Segmentation leaves available
+        # for the quality-check selection.
+        self.detected_leaves = []
+
+        # Number requested by user after
+        # segmentation.
+        self.pending_quality_request = None
+
+        # Final quality results.
+        self.quality_results = None
+
         self.roi_dialog = None
 
         self.run_start_time = None
+
         self.estimated_total_seconds = None
 
         self.timer = QTimer(self)
+
         self.timer.setInterval(1000)
+
         self.timer.timeout.connect(
             self.update_runtime_display
         )
 
-        self.performance_history = PerformanceHistory(
-            PERFORMANCE_HISTORY_FILE
+        self.performance_history = (
+            PerformanceHistory(
+                PERFORMANCE_HISTORY_FILE
+            )
         )
 
         self.create_ui()
 
     def create_ui(self):
+
         layout = QVBoxLayout(self)
 
-        title = QLabel("IMAGE ANALYSIS")
-        title.setStyleSheet(
-            "font-size: 28px; font-weight: bold;"
+        title = QLabel(
+            "IMAGE ANALYSIS"
         )
+
+        title.setStyleSheet(
+            "font-size: 28px; "
+            "font-weight: bold;"
+        )
+
         layout.addWidget(title)
 
-        image_group = QGroupBox("INPUT IMAGE")
-        image_layout = QHBoxLayout(image_group)
+        image_group = QGroupBox(
+            "INPUT IMAGE"
+        )
 
-        self.select_button = QPushButton("SELECT IMAGE")
-        self.image_name_label = QLabel("No image selected")
+        image_layout = QHBoxLayout(
+            image_group
+        )
 
-        image_layout.addWidget(self.select_button)
-        image_layout.addWidget(self.image_name_label)
+        self.select_button = QPushButton(
+            "SELECT IMAGE"
+        )
 
-        layout.addWidget(image_group)
+        self.image_name_label = QLabel(
+            "No image selected"
+        )
 
-        preview_group = QGroupBox("IMAGE PREVIEW")
-        preview_layout = QVBoxLayout(preview_group)
+        image_layout.addWidget(
+            self.select_button
+        )
 
-        self.image_preview = QLabel("Select an image")
+        image_layout.addWidget(
+            self.image_name_label
+        )
+
+        layout.addWidget(
+            image_group
+        )
+
+        preview_group = QGroupBox(
+            "IMAGE PREVIEW"
+        )
+
+        preview_layout = QVBoxLayout(
+            preview_group
+        )
+
+        self.image_preview = QLabel(
+            "Select an image"
+        )
+
         self.image_preview.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
 
-        # IMPORTANT:
-        # Do not let the pixmap determine the QLabel size.
-        # Otherwise setPixmap() can change the layout size,
-        # trigger resizeEvent(), scale again, and cause an
-        # endless resize loop.
         self.image_preview.setSizePolicy(
             QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Ignored
+            QSizePolicy.Policy.Ignored,
         )
-        self.image_preview.setMinimumSize(0, 220)
+
+        self.image_preview.setMinimumSize(
+            0,
+            220,
+        )
+
         self.image_preview.setStyleSheet(
             "border: 1px solid gray;"
         )
 
-        preview_layout.addWidget(self.image_preview)
-        layout.addWidget(preview_group)
+        preview_layout.addWidget(
+            self.image_preview
+        )
+
+        layout.addWidget(
+            preview_group
+        )
 
         region_layout = QHBoxLayout()
 
-        self.partial_region_button = QPushButton(
-            "PARTIAL REGION"
+        self.partial_region_button = (
+            QPushButton(
+                "PARTIAL REGION"
+            )
         )
 
-        self.clear_region_button = QPushButton(
-            "CLEAR REGION"
+        self.clear_region_button = (
+            QPushButton(
+                "CLEAR REGION"
+            )
         )
 
         self.region_label = QLabel(
             "REGION: FULL IMAGE"
         )
 
-        self.partial_region_button.setEnabled(False)
-        self.clear_region_button.setEnabled(False)
+        self.partial_region_button.setEnabled(
+            False
+        )
+
+        self.clear_region_button.setEnabled(
+            False
+        )
 
         region_layout.addWidget(
             self.partial_region_button
         )
+
         region_layout.addWidget(
             self.clear_region_button
         )
-        region_layout.addWidget(self.region_label)
 
-        layout.addLayout(region_layout)
+        region_layout.addWidget(
+            self.region_label
+        )
+
+        layout.addLayout(
+            region_layout
+        )
 
         segmentation_group = QGroupBox(
             "LEAF SEGMENTATION"
@@ -984,117 +1570,215 @@ class ImageAnalysis(QWidget):
             "RUN LEAF SEGMENTATION"
         )
 
-        self.segment_button.setMinimumHeight(45)
-        self.segment_button.setEnabled(False)
+        self.segment_button.setMinimumHeight(
+            45
+        )
+
+        self.segment_button.setEnabled(
+            False
+        )
 
         self.stop_button = QPushButton(
             "STOP SEGMENTATION"
         )
 
-        self.stop_button.setMinimumHeight(45)
-        self.stop_button.setEnabled(False)
+        self.stop_button.setMinimumHeight(
+            45
+        )
 
-        button_layout.addWidget(self.segment_button)
-        button_layout.addWidget(self.stop_button)
+        self.stop_button.setEnabled(
+            False
+        )
 
-        segmentation_layout.addLayout(button_layout)
+        button_layout.addWidget(
+            self.segment_button
+        )
 
-        current_label = QLabel("CURRENT OPERATION:")
+        button_layout.addWidget(
+            self.stop_button
+        )
+
+        segmentation_layout.addLayout(
+            button_layout
+        )
+
+        current_label = QLabel(
+            "CURRENT OPERATION:"
+        )
+
         current_label.setStyleSheet(
             "font-weight: bold;"
         )
-        segmentation_layout.addWidget(current_label)
 
-        self.status_label = QLabel("Ready")
+        segmentation_layout.addWidget(
+            current_label
+        )
+
+        self.status_label = QLabel(
+            "Ready"
+        )
+
         self.status_label.setStyleSheet(
             "font-weight: bold;"
         )
-        segmentation_layout.addWidget(self.status_label)
 
-        timing_group = QGroupBox("PROCESSING TIME")
-        timing_layout = QVBoxLayout(timing_group)
+        segmentation_layout.addWidget(
+            self.status_label
+        )
+
+        timing_group = QGroupBox(
+            "PROCESSING TIME"
+        )
+
+        timing_layout = QVBoxLayout(
+            timing_group
+        )
 
         self.start_time_label = QLabel(
             "START TIME: -"
         )
+
         self.elapsed_time_label = QLabel(
             "ELAPSED: 00:00"
         )
+
         self.remaining_time_label = QLabel(
             "ESTIMATED REMAINING: -"
         )
+
         self.end_time_label = QLabel(
             "ESTIMATED END: -"
         )
+
         self.estimate_basis_label = QLabel(
             "ESTIMATE BASIS: -"
         )
 
-        timing_layout.addWidget(self.start_time_label)
-        timing_layout.addWidget(self.elapsed_time_label)
-        timing_layout.addWidget(self.remaining_time_label)
-        timing_layout.addWidget(self.end_time_label)
-        timing_layout.addWidget(self.estimate_basis_label)
+        timing_layout.addWidget(
+            self.start_time_label
+        )
 
-        segmentation_layout.addWidget(timing_group)
+        timing_layout.addWidget(
+            self.elapsed_time_label
+        )
 
-        log_label = QLabel("ACTIVITY LOG:")
+        timing_layout.addWidget(
+            self.remaining_time_label
+        )
+
+        timing_layout.addWidget(
+            self.end_time_label
+        )
+
+        timing_layout.addWidget(
+            self.estimate_basis_label
+        )
+
+        segmentation_layout.addWidget(
+            timing_group
+        )
+
+        log_label = QLabel(
+            "ACTIVITY LOG:"
+        )
+
         log_label.setStyleSheet(
             "font-weight: bold;"
         )
-        segmentation_layout.addWidget(log_label)
+
+        segmentation_layout.addWidget(
+            log_label
+        )
 
         self.stage_log = QTextEdit()
+
         self.stage_log.setReadOnly(True)
-        self.stage_log.setMinimumHeight(120)
-        self.stage_log.setMaximumHeight(220)
 
-        segmentation_layout.addWidget(self.stage_log)
+        self.stage_log.setMinimumHeight(
+            120
+        )
 
-        progress_label = QLabel("PROGRESS:")
+        self.stage_log.setMaximumHeight(
+            220
+        )
+
+        segmentation_layout.addWidget(
+            self.stage_log
+        )
+
+        progress_label = QLabel(
+            "PROGRESS:"
+        )
+
         progress_label.setStyleSheet(
             "font-weight: bold;"
         )
-        segmentation_layout.addWidget(progress_label)
+
+        segmentation_layout.addWidget(
+            progress_label
+        )
 
         self.progress_bar = QProgressBar()
+
         self.progress_bar.setMinimum(0)
+
         self.progress_bar.setMaximum(100)
+
         self.progress_bar.setValue(0)
 
-        segmentation_layout.addWidget(self.progress_bar)
-        layout.addWidget(segmentation_group)
+        segmentation_layout.addWidget(
+            self.progress_bar
+        )
+
+        layout.addWidget(
+            segmentation_group
+        )
 
         self.select_button.clicked.connect(
             self.select_image
         )
+
         self.partial_region_button.clicked.connect(
             self.open_partial_region
         )
+
         self.clear_region_button.clicked.connect(
             self.clear_region
         )
+
         self.segment_button.clicked.connect(
             self.run_segmentation
         )
+
         self.stop_button.clicked.connect(
             self.stop_segmentation
         )
 
     def log(self, message):
+
         print(
             f"[IMAGE ANALYSIS] {message}",
-            flush=True
+            flush=True,
         )
 
-    def add_stage_message(self, message):
+    def add_stage_message(
+        self,
+        message,
+    ):
+
         message = str(message).strip()
+
         if not message:
             return
 
-        # Prevent an immediate duplicate when a message is both
-        # emitted as a Qt stage signal and printed to stdout.
-        if getattr(self, "_last_stage_message", None) == message:
+        if (
+            getattr(
+                self,
+                "_last_stage_message",
+                None,
+            )
+            == message
+        ):
             return
 
         self._last_stage_message = message
@@ -1107,17 +1791,34 @@ class ImageAnalysis(QWidget):
             f"[{timestamp}] {message}"
         )
 
-        scrollbar = self.stage_log.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        scrollbar = (
+            self.stage_log.verticalScrollBar()
+        )
 
-    def format_duration(self, seconds):
-        seconds = max(0, int(seconds))
+        scrollbar.setValue(
+            scrollbar.maximum()
+        )
+
+    def format_duration(
+        self,
+        seconds,
+    ):
+
+        seconds = max(
+            0,
+            int(seconds),
+        )
 
         hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
+
+        minutes = (
+            seconds % 3600
+        ) // 60
+
         secs = seconds % 60
 
         if hours > 0:
+
             return (
                 f"{hours:02d}:"
                 f"{minutes:02d}:"
@@ -1130,35 +1831,46 @@ class ImageAnalysis(QWidget):
         )
 
     def select_image(self):
+
         try:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Image",
-                r"C:\paprika\images",
-                (
-                    "Image Files "
-                    "(*.jpg *.jpeg *.png *.bmp "
-                    "*.tif *.tiff *.webp)"
+
+            file_path, _ = (
+                QFileDialog.getOpenFileName(
+                    self,
+                    "Select Image",
+                    str(
+                        PROJECT_ROOT
+                        / "images"
+                    ),
+                    (
+                        "Image Files "
+                        "(*.jpg *.jpeg *.png *.bmp "
+                        "*.tif *.tiff *.webp)"
+                    ),
                 )
             )
 
             if not file_path:
                 return
 
-            self.selected_image = Path(file_path)
+            self.selected_image = Path(
+                file_path
+            )
 
             image = cv2.imread(
                 str(self.selected_image)
             )
 
             if image is None:
+
                 raise ValueError(
-                    f"Could not read image:\n"
+                    "Could not read image:\n"
                     f"{self.selected_image}"
                 )
 
-            self.original_image_height, (
-                self.original_image_width
+            (
+                self.original_image_height,
+                self.original_image_width,
             ) = image.shape[:2]
 
             self.image_name_label.setText(
@@ -1167,23 +1879,39 @@ class ImageAnalysis(QWidget):
 
             self.roi_rect = None
 
-            self._preview_pixmap = QPixmap(
-                str(self.selected_image)
+            self._preview_pixmap = (
+                QPixmap(
+                    str(self.selected_image)
+                )
             )
 
             if self._preview_pixmap.isNull():
+
                 raise ValueError(
-                    f"Could not load image preview:\n"
+                    "Could not load image "
+                    "preview:\n"
                     f"{self.selected_image}"
                 )
 
             self.image_preview.clear()
+
             self.update_image_preview()
 
-            self.partial_region_button.setEnabled(True)
-            self.clear_region_button.setEnabled(False)
-            self.segment_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
+            self.partial_region_button.setEnabled(
+                True
+            )
+
+            self.clear_region_button.setEnabled(
+                False
+            )
+
+            self.segment_button.setEnabled(
+                True
+            )
+
+            self.stop_button.setEnabled(
+                False
+            )
 
             self.status_label.setText(
                 "Image selected - ready"
@@ -1194,7 +1922,12 @@ class ImageAnalysis(QWidget):
             )
 
             self.stage_log.clear()
+
             self._last_stage_message = None
+
+            self.detected_leaves = []
+            self.pending_quality_request = None
+            self.quality_results = None
 
             self.add_stage_message(
                 "Image selected successfully."
@@ -1208,52 +1941,70 @@ class ImageAnalysis(QWidget):
             self.start_time_label.setText(
                 "START TIME: -"
             )
+
             self.elapsed_time_label.setText(
                 "ELAPSED: 00:00"
             )
+
             self.remaining_time_label.setText(
                 "ESTIMATED REMAINING: -"
             )
+
             self.end_time_label.setText(
                 "ESTIMATED END: -"
             )
+
             self.estimate_basis_label.setText(
                 "ESTIMATE BASIS: -"
             )
 
-            self.progress_bar.setMaximum(100)
-            self.progress_bar.setValue(0)
+            self.progress_bar.setMaximum(
+                100
+            )
+
+            self.progress_bar.setValue(
+                0
+            )
 
         except Exception as exc:
+
             self.handle_error(
                 "IMAGE SELECTION ERROR",
-                exc
+                exc,
             )
 
     def open_partial_region(self):
+
         if self.selected_image is None:
+
             QMessageBox.warning(
                 self,
                 "PARTIAL REGION",
-                "Please select an image first."
+                "Please select an image first.",
             )
+
             return
 
         if self.thread is not None:
             return
 
+        if self.quality_thread is not None:
+            return
+
         try:
+
             self.status_label.setText(
                 "Waiting for region selection..."
             )
 
             self.add_stage_message(
-                "Opening PARTIAL REGION selection window."
+                "Opening PARTIAL REGION "
+                "selection window."
             )
 
             self.roi_dialog = ROISelector(
                 str(self.selected_image),
-                self
+                self,
             )
 
             self.roi_dialog.confirmed.connect(
@@ -1267,19 +2018,32 @@ class ImageAnalysis(QWidget):
             self.roi_dialog.exec()
 
         except Exception as exc:
+
             self.roi_dialog = None
+
             self.handle_error(
                 "PARTIAL REGION ERROR",
-                exc
+                exc,
             )
 
-    def on_roi_confirmed(self, roi):
+    def on_roi_confirmed(
+        self,
+        roi,
+    ):
+
         self.roi_rect = tuple(roi)
 
-        x1, y1, x2, y2 = self.roi_rect
+        x1, y1, x2, y2 = (
+            self.roi_rect
+        )
 
-        roi_width = x2 - x1 + 1
-        roi_height = y2 - y1 + 1
+        roi_width = (
+            x2 - x1 + 1
+        )
+
+        roi_height = (
+            y2 - y1 + 1
+        )
 
         self.region_label.setText(
             "REGION: "
@@ -1290,15 +2054,19 @@ class ImageAnalysis(QWidget):
             f"| SIZE={roi_width}x{roi_height}"
         )
 
-        self.clear_region_button.setEnabled(True)
+        self.clear_region_button.setEnabled(
+            True
+        )
 
         self.add_stage_message(
             "ROI confirmed: "
-            f"({x1},{y1}) - ({x2},{y2})"
+            f"({x1},{y1}) - "
+            f"({x2},{y2})"
         )
 
         self.status_label.setText(
-            "ROI confirmed - starting segmentation..."
+            "ROI confirmed - "
+            "starting segmentation..."
         )
 
         self.roi_dialog = None
@@ -1306,6 +2074,7 @@ class ImageAnalysis(QWidget):
         self.run_segmentation()
 
     def on_roi_cancelled(self):
+
         self.roi_dialog = None
 
         self.status_label.setText(
@@ -1317,9 +2086,12 @@ class ImageAnalysis(QWidget):
         )
 
     def clear_region(self):
+
         self.roi_rect = None
 
-        self.clear_region_button.setEnabled(False)
+        self.clear_region_button.setEnabled(
+            False
+        )
 
         self.region_label.setText(
             "REGION: FULL IMAGE"
@@ -1330,55 +2102,74 @@ class ImageAnalysis(QWidget):
         )
 
         self.add_stage_message(
-            "ROI cleared - full image will be analyzed."
+            "ROI cleared - full image "
+            "will be analyzed."
         )
 
     def update_image_preview(self):
+
         if self._preview_pixmap.isNull():
             return
 
-        target_size = self.image_preview.size()
-
-        if target_size.width() <= 1 or target_size.height() <= 1:
-            return
-
-        scaled_pixmap = self._preview_pixmap.scaled(
-            target_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
+        target_size = (
+            self.image_preview.size()
         )
 
-        # Do not call setPixmap() if the displayed pixmap is already
-        # the same size. This avoids unnecessary repaint/resize cycles.
-        current_pixmap = self.image_preview.pixmap()
+        if (
+            target_size.width() <= 1
+            or target_size.height() <= 1
+        ):
+            return
+
+        scaled_pixmap = (
+            self._preview_pixmap.scaled(
+                target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+        current_pixmap = (
+            self.image_preview.pixmap()
+        )
 
         if (
             current_pixmap is not None
             and not current_pixmap.isNull()
-            and current_pixmap.size() == scaled_pixmap.size()
+            and current_pixmap.size()
+            == scaled_pixmap.size()
         ):
             return
 
-        self.image_preview.setPixmap(scaled_pixmap)
+        self.image_preview.setPixmap(
+            scaled_pixmap
+        )
 
-    def resizeEvent(self, event):
+    def resizeEvent(
+        self,
+        event,
+    ):
+
         super().resizeEvent(event)
 
-        # The QLabel uses QSizePolicy.Ignored, so changing its pixmap
-        # cannot request a larger layout size and cannot recursively
-        # resize the window.
         self.update_image_preview()
 
     def run_segmentation(self):
+
         if self.selected_image is None:
+
             QMessageBox.warning(
                 self,
                 "IMAGE ANALYSIS",
-                "Please select an image first."
+                "Please select an image first.",
             )
+
             return
 
         if self.thread is not None:
+            return
+
+        if self.quality_thread is not None:
             return
 
         image = cv2.imread(
@@ -1386,47 +2177,73 @@ class ImageAnalysis(QWidget):
         )
 
         if image is None:
+
             QMessageBox.critical(
                 self,
                 "IMAGE ANALYSIS",
-                "Could not read the selected image."
+                "Could not read the selected image.",
             )
+
             return
 
         height, width = image.shape[:2]
 
         if self.roi_rect is not None:
-            x1, y1, x2, y2 = self.roi_rect
-            estimate_width = x2 - x1 + 1
-            estimate_height = y2 - y1 + 1
-            analysis_description = (
-                f"ROI {estimate_width}x{estimate_height}"
-            )
-        else:
-            estimate_width = width
-            estimate_height = height
-            analysis_description = (
-                f"FULL IMAGE {width}x{height}"
+
+            x1, y1, x2, y2 = (
+                self.roi_rect
             )
 
-        extension = self.selected_image.suffix.lower()
+            estimate_width = (
+                x2 - x1 + 1
+            )
+
+            estimate_height = (
+                y2 - y1 + 1
+            )
+
+            analysis_description = (
+                f"ROI "
+                f"{estimate_width}x"
+                f"{estimate_height}"
+            )
+
+        else:
+
+            estimate_width = width
+            estimate_height = height
+
+            analysis_description = (
+                f"FULL IMAGE "
+                f"{width}x{height}"
+            )
+
+        extension = (
+            self.selected_image.suffix.lower()
+        )
+
         model_name = self.model_name()
 
         self.estimated_total_seconds = (
-            self.performance_history.estimate_duration(
+            self.performance_history
+            .estimate_duration(
                 model_name,
                 extension,
                 estimate_width,
-                estimate_height
+                estimate_height,
             )
         )
 
-        self.run_start_time = datetime.now()
+        self.run_start_time = (
+            datetime.now()
+        )
 
         estimated_end = (
             self.run_start_time
             + timedelta(
-                seconds=self.estimated_total_seconds
+                seconds=(
+                    self.estimated_total_seconds
+                )
             )
         )
 
@@ -1457,7 +2274,9 @@ class ImageAnalysis(QWidget):
         )
 
         self.timer.start()
+
         self.stage_log.clear()
+
         self._last_stage_message = None
 
         self.add_stage_message(
@@ -1465,24 +2284,49 @@ class ImageAnalysis(QWidget):
         )
 
         if self.roi_rect is not None:
+
             self.add_stage_message(
                 "Using selected ROI: "
                 f"{self.roi_rect}"
             )
+
         else:
+
             self.add_stage_message(
                 "Using full image."
             )
 
-        self.status_label.setText("Starting...")
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
+        self.status_label.setText(
+            "Starting..."
+        )
 
-        self.select_button.setEnabled(False)
-        self.partial_region_button.setEnabled(False)
-        self.clear_region_button.setEnabled(False)
-        self.segment_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        self.select_button.setEnabled(
+            False
+        )
+
+        self.partial_region_button.setEnabled(
+            False
+        )
+
+        self.clear_region_button.setEnabled(
+            False
+        )
+
+        self.segment_button.setEnabled(
+            False
+        )
+
+        self.stop_button.setEnabled(
+            True
+        )
 
         self.log(
             "Starting segmentation: "
@@ -1492,29 +2336,59 @@ class ImageAnalysis(QWidget):
         self.thread = QThread()
 
         self.worker = SegmentationWorker(
-            image_path=str(self.selected_image),
-            model_path=str(MODEL_PATH),
-            roi_rect=self.roi_rect
+            image_path=str(
+                self.selected_image
+            ),
+            model_path=str(
+                MODEL_PATH
+            ),
+            roi_rect=self.roi_rect,
         )
 
-        self.worker.moveToThread(self.thread)
+        self.worker.moveToThread(
+            self.thread
+        )
 
-        self.thread.started.connect(self.worker.run)
+        self.thread.started.connect(
+            self.worker.run
+        )
 
-        self.worker.stage.connect(self.on_stage)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.busy.connect(self.on_busy)
-        self.worker.activity.connect(self.on_worker_activity)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.error.connect(self.on_error)
-        self.worker.cancelled.connect(self.on_cancelled)
+        self.worker.stage.connect(
+            self.on_stage
+        )
+
+        self.worker.progress.connect(
+            self.on_progress
+        )
+
+        self.worker.busy.connect(
+            self.on_busy
+        )
+
+        self.worker.activity.connect(
+            self.on_worker_activity
+        )
+
+        self.worker.finished.connect(
+            self.on_finished
+        )
+
+        self.worker.error.connect(
+            self.on_error
+        )
+
+        self.worker.cancelled.connect(
+            self.on_cancelled
+        )
 
         self.worker.finished.connect(
             self.thread.quit
         )
+
         self.worker.error.connect(
             self.thread.quit
         )
+
         self.worker.cancelled.connect(
             self.thread.quit
         )
@@ -1522,6 +2396,7 @@ class ImageAnalysis(QWidget):
         self.thread.finished.connect(
             self.worker.deleteLater
         )
+
         self.thread.finished.connect(
             self.thread_finished
         )
@@ -1529,9 +2404,13 @@ class ImageAnalysis(QWidget):
         self.thread.start()
 
     def model_name(self):
-        return Path(MODEL_PATH).name
+
+        return Path(
+            MODEL_PATH
+        ).name
 
     def update_runtime_display(self):
+
         if self.run_start_time is None:
             return
 
@@ -1545,7 +2424,10 @@ class ImageAnalysis(QWidget):
             f"{self.format_duration(elapsed)}"
         )
 
-        if self.estimated_total_seconds is None:
+        if (
+            self.estimated_total_seconds
+            is None
+        ):
             return
 
         remaining = (
@@ -1556,13 +2438,17 @@ class ImageAnalysis(QWidget):
         remaining_display = (
             "00:00"
             if remaining < 0
-            else self.format_duration(remaining)
+            else self.format_duration(
+                remaining
+            )
         )
 
         estimated_end = (
             self.run_start_time
             + timedelta(
-                seconds=self.estimated_total_seconds
+                seconds=(
+                    self.estimated_total_seconds
+                )
             )
         )
 
@@ -1577,6 +2463,7 @@ class ImageAnalysis(QWidget):
         )
 
     def stop_segmentation(self):
+
         if self.worker is None:
             return
 
@@ -1584,86 +2471,176 @@ class ImageAnalysis(QWidget):
             "User pressed STOP SEGMENTATION."
         )
 
-        self.stop_button.setEnabled(False)
+        self.stop_button.setEnabled(
+            False
+        )
+
         self.status_label.setText(
             "STOP REQUESTED..."
         )
 
         self.add_stage_message(
             "STOP REQUESTED - "
-            "waiting for current operation to finish..."
+            "waiting for current operation "
+            "to finish..."
         )
 
         self.worker.request_stop()
 
-    def on_worker_activity(self, message):
-        self.add_stage_message(message)
+    def on_worker_activity(
+        self,
+        message,
+    ):
 
-    def on_stage(self, message):
-        self.status_label.setText(message)
-        self.add_stage_message(message)
+        self.add_stage_message(
+            message
+        )
+
+    def on_stage(
+        self,
+        message,
+    ):
+
+        self.status_label.setText(
+            message
+        )
+
+        self.add_stage_message(
+            message
+        )
+
         self.log(message)
 
-    def on_progress(self, value):
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(value)
+    def on_progress(
+        self,
+        value,
+    ):
 
-    def on_busy(self, is_busy):
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            value
+        )
+
+    def on_busy(
+        self,
+        is_busy,
+    ):
+
         if is_busy:
-            self.progress_bar.setMaximum(0)
+
+            self.progress_bar.setMaximum(
+                0
+            )
+
             self.status_label.setText(
                 "Running SAM 2 segmentation..."
             )
+
             self.add_stage_message(
                 "Running SAM 2 segmentation..."
             )
+
             self.log(
                 "SAM 2 inference is running..."
             )
-        else:
-            self.progress_bar.setMaximum(100)
 
-    def on_finished(self, result):
+        else:
+
+            self.progress_bar.setMaximum(
+                100
+            )
+
+    def on_finished(
+        self,
+        result,
+    ):
+
         self.timer.stop()
 
-        mask_count = result["mask_count"]
-        width = result["width"]
-        height = result["height"]
+        mask_count = result[
+            "mask_count"
+        ]
+
+        width = result[
+            "width"
+        ]
+
+        height = result[
+            "height"
+        ]
+
+        # Keep the complete segmentation
+        # result in memory for the optional
+        # quality-check stage.
+        self.detected_leaves = result.get(
+            "leaves",
+            [],
+        )
 
         if self.run_start_time is not None:
+
             duration = (
                 datetime.now()
                 - self.run_start_time
             ).total_seconds()
+
         else:
+
             duration = 0
 
         self.performance_history.save_run(
             model_name=self.model_name(),
-            extension=self.selected_image.suffix.lower(),
+            extension=(
+                self.selected_image
+                .suffix.lower()
+            ),
             width=width,
             height=height,
-            duration_seconds=duration
+            duration_seconds=duration,
         )
 
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(100)
+        self.progress_bar.setMaximum(
+            100
+        )
 
-        elapsed_display = self.format_duration(duration)
+        self.progress_bar.setValue(
+            100
+        )
+
+        elapsed_display = (
+            self.format_duration(
+                duration
+            )
+        )
 
         message = (
-            f"COMPLETED - {mask_count} masks"
+            f"COMPLETED - "
+            f"{mask_count} masks"
         )
 
-        self.status_label.setText(message)
-        self.add_stage_message(message)
+        self.status_label.setText(
+            message
+        )
+
+        self.add_stage_message(
+            message
+        )
 
         self.add_stage_message(
             "TOTAL TIME: "
             f"{elapsed_display}"
         )
 
+        self.add_stage_message(
+            "SEGMENTATION FOUND: "
+            f"{len(self.detected_leaves)} leaves"
+        )
+
         if result.get("roi") is not None:
+
             self.add_stage_message(
                 "ANALYZED ROI: "
                 f"{result['roi']}"
@@ -1700,30 +2677,424 @@ class ImageAnalysis(QWidget):
 
         self.log(message)
 
+        # Segmentation has already completed
+        # and all segmentation files have been
+        # saved before this dialog is shown.
         QMessageBox.information(
             self,
             "LEAF SEGMENTATION",
             "Segmentation completed.\n\n"
             f"Masks: {mask_count}\n"
             f"Total time: {elapsed_display}\n"
-            f"Database media ID: {result.get('media_id')}\n"
-            f"Database run ID: {result.get('run_id')}\n\n"
+            f"Database media ID: "
+            f"{result.get('media_id')}\n"
+            f"Database run ID: "
+            f"{result.get('run_id')}\n\n"
             "Run directory:\n"
-            f"{result['run_directory']}"
+            f"{result['run_directory']}",
+        )
+
+        count = len(
+            self.detected_leaves
+        )
+
+        if count <= 0:
+
+            self.pending_quality_request = None
+
+            self.add_stage_message(
+                "No segmented leaves available "
+                "for quality checking."
+            )
+
+            return
+
+        selected_count, ok = (
+            QInputDialog.getInt(
+                self,
+                "LEAF QUALITY CHECK",
+                (
+                    f"Segmentation found: "
+                    f"{count} leaves\n\n"
+                    "How many leaves do you "
+                    "want to send to quality "
+                    "checking?"
+                ),
+                min(
+                    10,
+                    count,
+                ),
+                1,
+                count,
+                1,
+            )
+        )
+
+        if not ok:
+
+            self.pending_quality_request = None
+
+            self.add_stage_message(
+                "Leaf quality checking cancelled. "
+                "All segmentation outputs "
+                "remain saved."
+            )
+
+            self.status_label.setText(
+                "Segmentation completed - "
+                "quality check cancelled"
+            )
+
+            return
+
+        self.pending_quality_request = (
+            selected_count
+        )
+
+        self.add_stage_message(
+            "Leaf quality check requested for "
+            f"{selected_count} of "
+            f"{count} segmented leaves."
+        )
+
+        self.status_label.setText(
+            "Preparing leaf quality check..."
+        )
+
+    def on_quality_progress(
+        self,
+        value,
+    ):
+
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            value
+        )
+
+    def on_quality_finished(
+        self,
+        result,
+    ):
+
+        self.quality_results = result.get(
+            "leaves",
+            [],
+        )
+
+        count = result.get(
+            "count",
+            len(self.quality_results),
+        )
+
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            100
+        )
+
+        self.status_label.setText(
+            "QUALITY CHECK COMPLETED - "
+            f"{count} leaves"
+        )
+
+        self.add_stage_message(
+            "QUALITY CHECK COMPLETED - "
+            f"{count} leaves"
+        )
+
+        scores = []
+
+        for leaf in self.quality_results:
+
+            score = leaf.get(
+                "quality_score"
+            )
+
+            if score is not None:
+                scores.append(score)
+
+        if scores:
+
+            self.add_stage_message(
+                "Quality scores calculated for "
+                f"{len(scores)} leaves."
+            )
+
+        ranks = []
+
+        for leaf in self.quality_results:
+
+            rank = leaf.get(
+                "quality_rank"
+            )
+
+            if rank is not None:
+                ranks.append(rank)
+
+        if ranks:
+
+            self.add_stage_message(
+                "Quality ranking completed for "
+                f"{len(ranks)} leaves."
+            )
+
+        self.add_stage_message(
+            "All segmentation outputs remain saved."
+        )
+
+        QMessageBox.information(
+            self,
+            "LEAF QUALITY CHECK",
+            "Leaf quality checking completed.\n\n"
+            f"Leaves checked: {count}\n\n"
+            "All segmentation outputs remain saved.",
+        )
+
+    def on_quality_error(
+        self,
+        error_type,
+        error_details,
+    ):
+
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        self.status_label.setText(
+            "LEAF QUALITY CHECK FAILED"
+        )
+
+        self.add_stage_message(
+            "LEAF QUALITY CHECK FAILED"
+        )
+
+        self.add_stage_message(
+            f"ERROR TYPE: {error_type}"
+        )
+
+        self.add_stage_message(
+            error_details
+        )
+
+        QMessageBox.critical(
+            self,
+            "LEAF QUALITY ERROR",
+            (
+                f"ERROR TYPE:\n"
+                f"{error_type}\n\n"
+                f"{error_details}\n\n"
+                "Segmentation outputs remain saved."
+            ),
+        )
+
+    def start_quality_check(
+        self,
+        selected_count,
+    ):
+
+        if not self.detected_leaves:
+
+            self.log(
+                "No segmented leaves available "
+                "for quality checking."
+            )
+
+            self.status_label.setText(
+                "Segmentation completed"
+            )
+
+            return
+
+        selected_count = max(
+            1,
+            min(
+                selected_count,
+                len(
+                    self.detected_leaves
+                ),
+            ),
+        )
+
+        # IMPORTANT:
+        # We do NOT rank all leaves first.
+        # Only the first N segmented leaves
+        # requested by the user are sent to
+        # the quality ranker.
+        selected_leaves = (
+            self.detected_leaves[
+                :selected_count
+            ]
+        )
+
+        self.quality_results = None
+
+        self.status_label.setText(
+            "Running quality check on "
+            f"{selected_count} leaves..."
+        )
+
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+        self.stop_button.setEnabled(
+            False
+        )
+
+        self.select_button.setEnabled(
+            False
+        )
+
+        self.partial_region_button.setEnabled(
+            False
+        )
+
+        self.clear_region_button.setEnabled(
+            False
+        )
+
+        self.segment_button.setEnabled(
+            False
+        )
+
+        self.add_stage_message(
+            "LEAF QUALITY CHECK: "
+            f"{selected_count} of "
+            f"{len(self.detected_leaves)} "
+            "leaves"
+        )
+
+        self.add_stage_message(
+            "Sending only the selected "
+            "segmentation results to "
+            "quality analysis."
+        )
+
+        self.quality_thread = QThread()
+
+        self.quality_worker = (
+            LeafQualityWorker(
+                image_path=str(
+                    self.selected_image
+                ),
+                selected_leaves=selected_leaves,
+            )
+        )
+
+        self.quality_worker.moveToThread(
+            self.quality_thread
+        )
+
+        self.quality_thread.started.connect(
+            self.quality_worker.run
+        )
+
+        self.quality_worker.progress.connect(
+            self.on_quality_progress
+        )
+
+        self.quality_worker.activity.connect(
+            self.on_worker_activity
+        )
+
+        self.quality_worker.finished.connect(
+            self.on_quality_finished
+        )
+
+        self.quality_worker.error.connect(
+            self.on_quality_error
+        )
+
+        self.quality_worker.finished.connect(
+            self.quality_thread.quit
+        )
+
+        self.quality_worker.error.connect(
+            self.quality_thread.quit
+        )
+
+        self.quality_thread.finished.connect(
+            self.quality_worker.deleteLater
+        )
+
+        self.quality_thread.finished.connect(
+            self.quality_thread_finished
+        )
+
+        self.quality_thread.start()
+
+    def quality_thread_finished(self):
+
+        self.log(
+            "Leaf quality worker finished."
+        )
+
+        if self.quality_thread is not None:
+
+            self.quality_thread.deleteLater()
+
+        self.quality_thread = None
+        self.quality_worker = None
+
+        self.select_button.setEnabled(
+            self.selected_image is not None
+        )
+
+        self.partial_region_button.setEnabled(
+            self.selected_image is not None
+        )
+
+        self.segment_button.setEnabled(
+            self.selected_image is not None
+        )
+
+        self.clear_region_button.setEnabled(
+            self.roi_rect is not None
+        )
+
+        self.stop_button.setEnabled(
+            False
         )
 
     def on_cancelled(self):
+
         self.timer.stop()
 
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(
+            100
+        )
 
-        message = "SEGMENTATION STOPPED BY USER"
+        self.progress_bar.setValue(
+            0
+        )
 
-        self.status_label.setText(message)
-        self.add_stage_message(message)
+        message = (
+            "SEGMENTATION STOPPED BY USER"
+        )
+
+        self.status_label.setText(
+            message
+        )
+
+        self.add_stage_message(
+            message
+        )
 
         if self.run_start_time is not None:
+
             elapsed = (
                 datetime.now()
                 - self.run_start_time
@@ -1744,11 +3115,21 @@ class ImageAnalysis(QWidget):
 
         self.log(message)
 
-    def on_error(self, error_type, error_details):
+    def on_error(
+        self,
+        error_type,
+        error_details,
+    ):
+
         self.timer.stop()
 
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(
+            100
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
 
         self.status_label.setText(
             "SEGMENTATION FAILED"
@@ -1757,30 +3138,62 @@ class ImageAnalysis(QWidget):
         self.add_stage_message(
             "SEGMENTATION FAILED"
         )
+
         self.add_stage_message(
             f"ERROR TYPE: {error_type}"
         )
-        self.add_stage_message(error_details)
+
+        self.add_stage_message(
+            error_details
+        )
 
         QMessageBox.critical(
             self,
             "LEAF SEGMENTATION ERROR",
-            f"ERROR TYPE:\n{error_type}\n\n"
-            f"{error_details}"
+            (
+                f"ERROR TYPE:\n"
+                f"{error_type}\n\n"
+                f"{error_details}"
+            ),
         )
 
     def thread_finished(self):
+
         self.log(
             "Segmentation worker finished."
         )
 
         if self.thread is not None:
+
             self.thread.deleteLater()
 
         self.thread = None
         self.worker = None
 
-        self.select_button.setEnabled(True)
+        # If the user selected a number of
+        # leaves for quality checking, start
+        # that worker only after the
+        # segmentation thread has fully ended.
+        if (
+            self.pending_quality_request
+            is not None
+        ):
+
+            selected_count = (
+                self.pending_quality_request
+            )
+
+            self.pending_quality_request = None
+
+            self.start_quality_check(
+                selected_count
+            )
+
+            return
+
+        self.select_button.setEnabled(
+            self.selected_image is not None
+        )
 
         self.partial_region_button.setEnabled(
             self.selected_image is not None
@@ -1794,25 +3207,66 @@ class ImageAnalysis(QWidget):
             self.roi_rect is not None
         )
 
-        self.stop_button.setEnabled(False)
+        self.stop_button.setEnabled(
+            False
+        )
 
-    def handle_error(self, title, exc):
+    def handle_error(
+        self,
+        title,
+        exc,
+    ):
+
         self.timer.stop()
 
         error_type = type(exc).__name__
+
         error_message = str(exc)
-        full_traceback = traceback.format_exc()
+
+        full_traceback = (
+            traceback.format_exc()
+        )
 
         print("", flush=True)
-        print("=" * 80, flush=True)
-        print(title, flush=True)
-        print(f"ERROR TYPE: {error_type}", flush=True)
-        print(f"ERROR MESSAGE: {error_message}", flush=True)
-        print("-" * 80, flush=True)
-        print(full_traceback, flush=True)
-        print("=" * 80, flush=True)
 
-        self.status_label.setText("ERROR")
+        print(
+            "=" * 80,
+            flush=True,
+        )
+
+        print(
+            title,
+            flush=True,
+        )
+
+        print(
+            f"ERROR TYPE: {error_type}",
+            flush=True,
+        )
+
+        print(
+            f"ERROR MESSAGE: {error_message}",
+            flush=True,
+        )
+
+        print(
+            "-" * 80,
+            flush=True,
+        )
+
+        print(
+            full_traceback,
+            flush=True,
+        )
+
+        print(
+            "=" * 80,
+            flush=True,
+        )
+
+        self.status_label.setText(
+            "ERROR"
+        )
 
         self.add_stage_message(
             f"{title}: {error_message}"
@@ -1821,28 +3275,64 @@ class ImageAnalysis(QWidget):
         QMessageBox.critical(
             self,
             title,
-            f"ERROR TYPE:\n{error_type}\n\n"
-            f"ERROR MESSAGE:\n{error_message}\n\n"
-            f"FULL TRACEBACK:\n{full_traceback}"
+            (
+                f"ERROR TYPE:\n"
+                f"{error_type}\n\n"
+                f"ERROR MESSAGE:\n"
+                f"{error_message}\n\n"
+                f"FULL TRACEBACK:\n"
+                f"{full_traceback}"
+            ),
         )
 
-    def closeEvent(self, event):
+    def closeEvent(
+        self,
+        event,
+    ):
+
         if self.thread is not None:
+
             reply = QMessageBox.question(
                 self,
                 "SEGMENTATION RUNNING",
-                "Segmentation is currently running.\n\n"
-                "Do you want to stop the operation?",
+                (
+                    "Segmentation is currently "
+                    "running.\n\n"
+                    "Do you want to stop "
+                    "the operation?"
+                ),
                 (
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.No
-                )
+                ),
             )
 
-            if reply == QMessageBox.StandardButton.Yes:
+            if (
+                reply
+                == QMessageBox.StandardButton.Yes
+            ):
+
                 self.stop_segmentation()
 
             event.ignore()
+
+            return
+
+        if self.quality_thread is not None:
+
+            QMessageBox.information(
+                self,
+                "LEAF QUALITY CHECK RUNNING",
+                (
+                    "Leaf quality checking is "
+                    "currently running.\n\n"
+                    "Please wait until it finishes "
+                    "before closing."
+                ),
+            )
+
+            event.ignore()
+
             return
 
         event.accept()
