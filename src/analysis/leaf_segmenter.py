@@ -6,7 +6,19 @@ import cv2
 import numpy as np
 
 from ultralytics import SAM
-from ultralytics.models.sam.predict import SAM2Predictor
+
+
+try:
+    from ..leaf_validation.leaf_validator import LeafValidator
+except ImportError:
+    import sys
+
+    PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+    from src.analysis.leaf_validation.leaf_validator import LeafValidator
 
 
 class SegmentationStopped(Exception):
@@ -84,7 +96,6 @@ class LeafSegmenter:
         )
 
         self.model = None
-        self.sam_predictor = None
         self._stop_event = threading.Event()
 
         # ------------------------------------------------------------
@@ -93,6 +104,15 @@ class LeafSegmenter:
 
         self.tile_size = int(tile_size)
         self.tile_overlap = float(tile_overlap)
+        self.max_tiles = int(max_tiles)
+        self.max_total_prompt_points = int(max_total_prompt_points)
+
+        # ------------------------------------------------------------
+        # External leaf validation
+        # ------------------------------------------------------------
+        # Reject obvious stems/stalks and unstructured green regions.
+        # Real green leaves are NOT rejected merely because they are green.
+        self.leaf_validator = LeafValidator(enabled=True)
 
         # ------------------------------------------------------------
         # Mask filtering
@@ -136,13 +156,6 @@ class LeafSegmenter:
         self.max_prompt_points = int(
             max_prompt_points
         )
-
-        # ------------------------------------------------------------
-        # Safety limits
-        # ------------------------------------------------------------
-
-        self.max_tiles = int(max_tiles)
-        self.max_total_prompt_points = int(max_total_prompt_points)
 
         # ------------------------------------------------------------
         # Clump splitting
@@ -208,22 +221,8 @@ class LeafSegmenter:
             flush=True,
         )
 
-        # Regular SAM wrapper is retained for independent point prompts.
         self.model = SAM(
             str(self.model_path)
-        )
-
-        # Automatic SAM generation must use the dedicated SAM predictor.
-        # crop_n_layers and points_stride are SAM-generator parameters, not
-        # generic YOLO arguments.
-        self.sam_predictor = SAM2Predictor(
-            overrides={
-                "conf": self.sam_conf,
-                "task": "segment",
-                "mode": "predict",
-                "imgsz": self.imgsz,
-                "model": str(self.model_path),
-            }
         )
 
         print(
@@ -493,55 +492,23 @@ class LeafSegmenter:
         return tiles
 
     # ================================================================
-    # POINT-PROMPT SAM
+    # AUTOMATIC SAM
     # ================================================================
 
     def _run_sam(
         self,
         image,
     ):
-        """Run independent SAM point prompts instead of automatic generation."""
 
-        if self.model is None:
-            raise RuntimeError(
-                "SAM point-prompt model is not initialized."
-            )
-
-        points = self._dense_leaf_points(image)
-        points = points[:self.max_prompt_points]
-
-        results = []
-
-        for point in points:
-            self._check_stop()
-
-            try:
-                result = self.model.predict(
-                    source=image,
-                    points=[
-                        float(point["x"]),
-                        float(point["y"]),
-                    ],
-                    labels=[1],
-                    device="mps",
-                    verbose=False,
-                    imgsz=self.imgsz,
-                    retina_masks=True,
-                )
-
-                if result:
-                    results.extend(result)
-
-            except Exception as exc:
-                print(
-                    "[LEAF SEGMENTER V6] "
-                    f"Point prompt failed "
-                    f"({point['x']},{point['y']}): "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-
-        return results
+        return self.model.predict(
+            source=image,
+            crop_n_layers=1,
+            points_stride=32,
+            conf=self.sam_conf,
+            verbose=False,
+            imgsz=self.imgsz,
+            retina_masks=True,
+        )
 
     # ================================================================
     # EXTRACT AUTOMATIC MASKS
@@ -1017,7 +984,6 @@ class LeafSegmenter:
                     1,
                 ],
 
-                device="mps",
                 verbose=False,
                 imgsz=self.imgsz,
                 retina_masks=True,
@@ -1768,6 +1734,49 @@ class LeafSegmenter:
         return True
 
     # ================================================================
+    # EXTERNAL LEAF VALIDATION
+    # ================================================================
+
+    def _validate_leaf_candidate(self, candidate, image):
+        """
+        Apply the external LeafValidator to one candidate.
+
+        The validator is deliberately conservative: green color alone is
+        never enough to reject a real leaf. It is used to remove obvious
+        stems/stalks and unstructured green regions before deduplication and
+        once again after clump splitting.
+        """
+        if self.leaf_validator is None:
+            return True
+
+        prompt_point = None
+        if "_prompt_x" in candidate and "_prompt_y" in candidate:
+            prompt_point = {
+                "x": candidate["_prompt_x"],
+                "y": candidate["_prompt_y"],
+            }
+
+        valid = self.leaf_validator.validate(
+            image=image,
+            mask=candidate["mask"],
+            prompt_point=prompt_point,
+        )
+
+        if not valid:
+            reason = self.leaf_validator.last_reason or "unknown"
+            self.diagnostics["rejected_non_leaf"] += 1
+
+            if reason == "stem":
+                self.diagnostics["rejected_stems"] += 1
+            elif reason in (
+                "unstructured_green_region",
+                "uniform_non_leaf_region",
+            ):
+                self.diagnostics["rejected_green_regions"] += 1
+
+        return valid
+
+    # ================================================================
     # DEDUPLICATION
     # ================================================================
 
@@ -2164,6 +2173,9 @@ class LeafSegmenter:
             "prompt_candidates": 0,
             "clump_candidates": 0,
             "watershed_pieces": 0,
+            "rejected_non_leaf": 0,
+            "rejected_stems": 0,
+            "rejected_green_regions": 0,
             "final_leaves": 0,
         }
 
@@ -2486,8 +2498,21 @@ class LeafSegmenter:
             flush=True,
         )
 
+        validated_candidates = []
+        for candidate in all_candidates:
+            self._check_stop()
+            if self._validate_leaf_candidate(candidate, image):
+                validated_candidates.append(candidate)
+
+        print(
+            "[LEAF SEGMENTER V6] "
+            f"Candidates after external leaf validation: "
+            f"{len(validated_candidates)}",
+            flush=True,
+        )
+
         prefiltered = self._deduplicate(
-            all_candidates
+            validated_candidates
         )
 
         print(
@@ -2528,6 +2553,17 @@ class LeafSegmenter:
                 final_candidates
             )
         )
+
+        # Apply the external validator again after watershed splitting.
+        # This protects the final result from pieces that are geometrically
+        # valid but are actually stems or unstructured green regions.
+        validated_final_candidates = []
+        for candidate in final_candidates:
+            self._check_stop()
+            if self._validate_leaf_candidate(candidate, image):
+                validated_final_candidates.append(candidate)
+
+        final_candidates = validated_final_candidates
 
         # FINAL DEDUP
         # ============================================================
@@ -2674,7 +2710,7 @@ if __name__ == "__main__":
         )
 
     # ---------------------------------------------------------------
-    # V4 configuration
+    # V6 configuration
     # ---------------------------------------------------------------
 
     segmenter = LeafSegmenter(
